@@ -19,7 +19,9 @@ public static class LgbmModel
         {
             if (Left[node] < 0)
                 return Value[node];
-            if (f[Feature[node]] <= Threshold[node])
+            double v = f[Feature[node]];
+            if (double.IsNaN(v)) v = 0.0;
+            if (v <= Threshold[node])
                 node = Left[node];
             else
                 node = Right[node];

@@ -61,6 +61,13 @@ def go_f32(x: float) -> str:
 # ---------------------------------------------------------------------------
 
 
+# LightGBM missing-value semantics (per split node):
+#   missing_type None : NaN is treated as 0.0, then compared normally
+#   missing_type Zero : NaN and |v| <= 1e-35 go to the default side
+#   missing_type NaN  : NaN goes to the default side
+_LGB_MISSING = {"None": 0, "Zero": 1, "NaN": 2}
+
+
 def _flatten_lgb(node: dict[str, Any], nodes: list[_Node]) -> int:
     idx = len(nodes)
     if "leaf_value" in node:
@@ -70,6 +77,8 @@ def _flatten_lgb(node: dict[str, Any], nodes: list[_Node]) -> int:
         "leaf": False,
         "feature": node["split_feature"],
         "threshold": float(node["threshold"]),
+        "default_left": bool(node.get("default_left", True)),
+        "missing": _LGB_MISSING.get(str(node.get("missing_type", "None")), 0),
         "left": None,
         "right": None,
     }
@@ -201,6 +210,7 @@ def _flatten_xgb_flat(tree: dict[str, Any], nodes: list[_Node]) -> int:
     si: Any = tree["split_indices"]
     sc: Any = tree["split_conditions"]
     bw: Any = tree["base_weights"]
+    dl: Any = tree["default_left"]
 
     def visit(nid: int) -> int:
         pos = len(nodes)
@@ -211,6 +221,8 @@ def _flatten_xgb_flat(tree: dict[str, Any], nodes: list[_Node]) -> int:
                 "leaf": False,
                 "feature": int(si[nid]),
                 "threshold": float(sc[nid]),
+                # missing (NaN) values follow the trained default direction
+                "missing_left": bool(int(dl[nid])),
                 "left": None,
                 "right": None,
             }
@@ -269,10 +281,23 @@ def export_cb(model_path: str, output: str, class_name: str, lang: str = "cs") -
     scale = float(sb[0]) if isinstance(sb[0], (int, float)) else float(sb[0][0])
     bias = float(sb[1][0]) if isinstance(sb[1], list) else float(sb[1])
 
+    # NaN routing per float feature: "AsTrue" sets the split bit for NaN,
+    # "AsFalse"/"AsIs" leave it unset (v > border is false for NaN anyway).
+    nan_true_by_feature: dict[int, bool] = {}
+    for ff in cb_json.get("features_info", {}).get("float_features", []):
+        idx = int(ff.get("feature_index", ff.get("flat_feature_index", 0)))
+        nan_true_by_feature[idx] = ff.get("nan_value_treatment") == "AsTrue"
+
     if lang == "go":
-        _write_go_catboost(trees, scale, bias, class_name, output, mode=mode)
+        _write_go_catboost(
+            trees, scale, bias, class_name, output, mode=mode,
+            nan_true_by_feature=nan_true_by_feature,
+        )
     else:
-        _write_cs_catboost(trees, scale, bias, class_name, output, mode=mode)
+        _write_cs_catboost(
+            trees, scale, bias, class_name, output, mode=mode,
+            nan_true_by_feature=nan_true_by_feature,
+        )
 
     _print_summary(
         "CatBoost",
@@ -309,6 +334,8 @@ def _write_cs_node_array(
     left_arr: list[int] = []
     right_arr: list[int] = []
     value: list[float] = []
+    missing_child: list[int] = []  # child index taken when the feature is NaN
+    missing_type: list[int] = []  # LightGBM: 0 = None, 1 = Zero, 2 = NaN
 
     for n in nodes:
         if n["leaf"]:
@@ -317,12 +344,23 @@ def _write_cs_node_array(
             left_arr.append(-1)
             right_arr.append(0)
             value.append(n["value"])
+            missing_child.append(0)
+            missing_type.append(0)
         else:
             feature.append(n["feature"])
             threshold.append(n["threshold"])
             left_arr.append(n["left"])
             right_arr.append(n["right"])
             value.append(0.0)
+            if xgboost:
+                missing_child.append(n["left"] if n["missing_left"] else n["right"])
+                missing_type.append(0)
+            else:
+                missing_child.append(n["left"] if n["default_left"] else n["right"])
+                missing_type.append(n["missing"])
+
+    # LightGBM: extra arrays only needed when some node routes missing values
+    lgb_has_missing = any(t != 0 for t in missing_type)
 
     if xgboost:
         thr_decl = (
@@ -330,14 +368,12 @@ def _write_cs_node_array(
             + ", ".join(f32_lit(v) for v in threshold)
             + "];"
         )
-        eval_cmp = "            if ((float)f[Feature[node]] < Threshold[node])"
     else:
         thr_decl = (
             "    private static readonly double[] Threshold = ["
             + ", ".join(f64(v) for v in threshold)
             + "];"
         )
-        eval_cmp = "            if (f[Feature[node]] <= Threshold[node])"
 
     lines: list[str] = [
         "using System.Runtime.CompilerServices;",
@@ -366,6 +402,27 @@ def _write_cs_node_array(
         "    private static readonly int[]    Right     = ["
         + ", ".join(map(str, right_arr))
         + "];",
+    ]
+
+    if xgboost:
+        lines.append(
+            "    private static readonly int[]    Missing   = ["
+            + ", ".join(map(str, missing_child))
+            + "];"
+        )
+    elif lgb_has_missing:
+        lines.append(
+            "    private static readonly int[]    Default   = ["
+            + ", ".join(map(str, missing_child))
+            + "];"
+        )
+        lines.append(
+            "    private static readonly byte[]   MissType  = ["
+            + ", ".join(map(str, missing_type))
+            + "];"
+        )
+
+    lines += [
         "    private static readonly double[] Value     = ["
         + ", ".join(f64(v) for v in value)
         + "];",
@@ -381,10 +438,49 @@ def _write_cs_node_array(
         "        {",
         "            if (Left[node] < 0)",
         "                return Value[node];",
-        eval_cmp,
-        "                node = Left[node];",
-        "            else",
-        "                node = Right[node];",
+        "            double v = f[Feature[node]];",
+    ]
+
+    if xgboost:
+        # XGBoost: NaN follows the trained default direction (Missing[node])
+        lines += [
+            "            if (double.IsNaN(v))",
+            "                node = Missing[node];",
+            "            else if ((float)v < Threshold[node])",
+            "                node = Left[node];",
+            "            else",
+            "                node = Right[node];",
+        ]
+    elif lgb_has_missing:
+        # Full LightGBM missing-value semantics (see MissType comment above)
+        lines += [
+            "            int m = MissType[node];",
+            "            if (double.IsNaN(v))",
+            "            {",
+            "                if (m == 2) { node = Default[node]; continue; }",
+            "                v = 0.0;  // missing_type None/Zero: NaN acts as 0",
+            "            }",
+            "            if (m == 1 && v >= -1e-35 && v <= 1e-35)",
+            "            {",
+            "                node = Default[node];",
+            "                continue;",
+            "            }",
+            "            if (v <= Threshold[node])",
+            "                node = Left[node];",
+            "            else",
+            "                node = Right[node];",
+        ]
+    else:
+        # LightGBM missing_type None everywhere: NaN is treated as 0.0
+        lines += [
+            "            if (double.IsNaN(v)) v = 0.0;",
+            "            if (v <= Threshold[node])",
+            "                node = Left[node];",
+            "            else",
+            "                node = Right[node];",
+        ]
+
+    lines += [
         "        }",
         "    }",
         "",
@@ -479,9 +575,13 @@ def _write_cs_catboost(
     output: str,
     mode: str = "regression",
     _num_class: int = 1,
+    nan_true_by_feature: dict[int, bool] | None = None,
 ) -> None:
+    nan_true_by_feature = nan_true_by_feature or {}
+
     split_features: list[int] = []
     split_borders: list[float] = []
+    split_nan_true: list[int] = []  # 1 when NaN sets the split bit ("AsTrue")
     tree_split_offset: list[int] = []
     tree_depth: list[int] = []
     leaf_values: list[float] = []
@@ -492,11 +592,17 @@ def _write_cs_catboost(
         splits = t["splits"]
         tree_depth.append(len(splits))
         for s in splits:
-            split_features.append(int(s["float_feature_index"]))
+            fidx = int(s["float_feature_index"])
+            split_features.append(fidx)
             split_borders.append(float(s["border"]))
+            split_nan_true.append(1 if nan_true_by_feature.get(fidx) else 0)
         tree_leaf_offset.append(len(leaf_values))
         for v in t["leaf_values"]:
             leaf_values.append(float(v))
+
+    # NaN comparing false already matches "AsFalse"/"AsIs"; the extra array is
+    # only needed when some feature routes NaN to the true side.
+    any_nan_true = any(split_nan_true)
 
     lines: list[str] = [
         "using System.Runtime.CompilerServices;",
@@ -513,6 +619,16 @@ def _write_cs_catboost(
         "    private static readonly double[] SplitBorder     = ["
         + ", ".join(f64(v) for v in split_borders)
         + "];",
+    ]
+
+    if any_nan_true:
+        lines.append(
+            "    private static readonly byte[]   SplitNanTrue    = ["
+            + ", ".join(map(str, split_nan_true))
+            + "];"
+        )
+
+    lines += [
         "    private static readonly int[]    TreeSplitOffset = ["
         + ", ".join(map(str, tree_split_offset))
         + "];",
@@ -526,7 +642,7 @@ def _write_cs_catboost(
         + ", ".join(map(str, tree_leaf_offset))
         + "];",
         "",
-        "    // bit l set when feature[split[l]] >= border[split[l]]",
+        "    // bit l set when feature[split[l]] > border[split[l]]",
         "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
         "    private static double EvalTree(int treeIdx, ReadOnlySpan<double> f)",
         "    {",
@@ -536,8 +652,22 @@ def _write_cs_catboost(
         "        for (int l = 0; l < depth; l++)",
         "        {",
         "            int s = splitOffset + l;",
-        "            if (f[SplitFeature[s]] >= SplitBorder[s])",
-        "                leafIdx |= (1 << l);",
+    ]
+
+    if any_nan_true:
+        lines += [
+            "            double v = f[SplitFeature[s]];",
+            "            bool bit = double.IsNaN(v) ? SplitNanTrue[s] == 1 : v > SplitBorder[s];",
+            "            if (bit)",
+            "                leafIdx |= (1 << l);",
+        ]
+    else:
+        lines += [
+            "            if (f[SplitFeature[s]] > SplitBorder[s])",
+            "                leafIdx |= (1 << l);",
+        ]
+
+    lines += [
         "        }",
         "        return LeafValues[TreeLeafOffset[treeIdx] + leafIdx];",
         "    }",
@@ -604,13 +734,14 @@ def _write_go_node_array(
     num_class: int = 1,
 ) -> None:
     pkg = class_name.lower()
-    needs_math = mode in ("binary", "multiclass")
 
     feature: list[int] = []
     threshold: list[float] = []
     left_arr: list[int] = []
     right_arr: list[int] = []
     value: list[float] = []
+    missing_child: list[int] = []  # child index taken when the feature is NaN
+    missing_type: list[int] = []  # LightGBM: 0 = None, 1 = Zero, 2 = NaN
 
     for n in nodes:
         if n["leaf"]:
@@ -619,50 +750,74 @@ def _write_go_node_array(
             left_arr.append(-1)
             right_arr.append(0)
             value.append(n["value"])
+            missing_child.append(0)
+            missing_type.append(0)
         else:
             feature.append(n["feature"])
             threshold.append(n["threshold"])
             left_arr.append(n["left"])
             right_arr.append(n["right"])
             value.append(0.0)
+            if xgboost:
+                missing_child.append(n["left"] if n["missing_left"] else n["right"])
+                missing_type.append(0)
+            else:
+                missing_child.append(n["left"] if n["default_left"] else n["right"])
+                missing_type.append(n["missing"])
+
+    # LightGBM: extra arrays only needed when some node routes missing values
+    lgb_has_missing = any(t != 0 for t in missing_type)
 
     if xgboost:
         thr_type = "float32"
         thr_vals = ", ".join(go_f32(v) for v in threshold)
-        eval_cmp = "\t\tif float32(f[feature[node]]) < threshold[node] {"
     else:
         thr_type = "float64"
         thr_vals = ", ".join(go_f64(v) for v in threshold)
-        eval_cmp = "\t\tif f[feature[node]] <= threshold[node] {"
 
     lines: list[str] = [f"package {pkg}", ""]
 
-    if needs_math:
-        lines += ['import "math"', ""]
+    # math is always needed now (math.IsNaN in eval)
+    lines += ['import "math"', ""]
 
-    # const block
-    const_lines = [f"\ttreeCount = {len(roots)}"]
+    # const block (gofmt aligns '=' within a block)
     if mode == "multiclass":
-        const_lines.append(f"\tnumClasses   = {num_class}")
-        const_lines.append("\ttreesPerClass = treeCount / numClasses")
+        const_lines = [
+            f"\ttreeCount     = {len(roots)}",
+            f"\tnumClasses    = {num_class}",
+            "\ttreesPerClass = treeCount / numClasses",
+        ]
+    else:
+        const_lines = [f"\ttreeCount = {len(roots)}"]
     if base_score != 0.0:
         const_lines.append(f"\tbaseScore = {go_f64(base_score)}")
 
     lines += ["const ("] + const_lines + [")", ""]
 
     # var block
-    lines += [
-        "//nolint:gochecknoglobals",
-        "var (",
+    var_lines = [
         "\tfeature   = []int{" + ", ".join(map(str, feature)) + "}",
         "\tthreshold = []" + thr_type + "{" + thr_vals + "}",
         "\tleft      = []int{" + ", ".join(map(str, left_arr)) + "}",
         "\tright     = []int{" + ", ".join(map(str, right_arr)) + "}",
+    ]
+    if xgboost:
+        var_lines.append(
+            "\tmissing   = []int{" + ", ".join(map(str, missing_child)) + "}"
+        )
+    elif lgb_has_missing:
+        var_lines.append(
+            "\tdefaultTo = []int{" + ", ".join(map(str, missing_child)) + "}"
+        )
+        var_lines.append(
+            "\tmissType  = []uint8{" + ", ".join(map(str, missing_type)) + "}"
+        )
+    var_lines += [
         "\tvalue     = []float64{" + ", ".join(go_f64(v) for v in value) + "}",
         "\troots     = []int{" + ", ".join(map(str, roots)) + "}",
-        ")",
-        "",
     ]
+
+    lines += ["//nolint:gochecknoglobals", "var ("] + var_lines + [")", ""]
 
     # eval function
     lines += [
@@ -672,11 +827,59 @@ def _write_go_node_array(
         "\t\tif left[node] < 0 {",
         "\t\t\treturn value[node]",
         "\t\t}",
-        eval_cmp,
-        "\t\t\tnode = left[node]",
-        "\t\t} else {",
-        "\t\t\tnode = right[node]",
-        "\t\t}",
+        "\t\tv := f[feature[node]]",
+    ]
+
+    if xgboost:
+        # XGBoost: NaN follows the trained default direction (missing[node])
+        lines += [
+            "\t\tswitch {",
+            "\t\tcase math.IsNaN(v):",
+            "\t\t\tnode = missing[node]",
+            "\t\tcase float32(v) < threshold[node]:",
+            "\t\t\tnode = left[node]",
+            "\t\tdefault:",
+            "\t\t\tnode = right[node]",
+            "\t\t}",
+        ]
+    elif lgb_has_missing:
+        # Full LightGBM missing-value semantics:
+        #   missType 0 (None): NaN acts as 0.0, then normal comparison
+        #   missType 1 (Zero): NaN and |v| <= 1e-35 go to defaultTo[node]
+        #   missType 2 (NaN) : NaN goes to defaultTo[node]
+        lines += [
+            "\t\tm := missType[node]",
+            "\t\tif math.IsNaN(v) {",
+            "\t\t\tif m == 2 {",
+            "\t\t\t\tnode = defaultTo[node]",
+            "\t\t\t\tcontinue",
+            "\t\t\t}",
+            "\t\t\tv = 0.0 // missing_type None/Zero: NaN acts as 0",
+            "\t\t}",
+            "\t\tif m == 1 && v >= -1e-35 && v <= 1e-35 {",
+            "\t\t\tnode = defaultTo[node]",
+            "\t\t\tcontinue",
+            "\t\t}",
+            "\t\tif v <= threshold[node] {",
+            "\t\t\tnode = left[node]",
+            "\t\t} else {",
+            "\t\t\tnode = right[node]",
+            "\t\t}",
+        ]
+    else:
+        # LightGBM missing_type None everywhere: NaN is treated as 0.0
+        lines += [
+            "\t\tif math.IsNaN(v) {",
+            "\t\t\tv = 0.0",
+            "\t\t}",
+            "\t\tif v <= threshold[node] {",
+            "\t\t\tnode = left[node]",
+            "\t\t} else {",
+            "\t\t\tnode = right[node]",
+            "\t\t}",
+        ]
+
+    lines += [
         "\t}",
         "}",
         "",
@@ -694,12 +897,14 @@ def _write_go_catboost(
     output: str,
     mode: str = "regression",
     _num_class: int = 1,
+    nan_true_by_feature: dict[int, bool] | None = None,
 ) -> None:
     pkg = class_name.lower()
-    needs_math = mode in ("binary", "multiclass")
+    nan_true_by_feature = nan_true_by_feature or {}
 
     split_features: list[int] = []
     split_borders: list[float] = []
+    split_nan_true: list[int] = []  # 1 when NaN sets the split bit ("AsTrue")
     tree_split_offset: list[int] = []
     tree_depth: list[int] = []
     leaf_values: list[float] = []
@@ -710,16 +915,42 @@ def _write_go_catboost(
         splits = t["splits"]
         tree_depth.append(len(splits))
         for s in splits:
-            split_features.append(int(s["float_feature_index"]))
+            fidx = int(s["float_feature_index"])
+            split_features.append(fidx)
             split_borders.append(float(s["border"]))
+            split_nan_true.append(1 if nan_true_by_feature.get(fidx) else 0)
         tree_leaf_offset.append(len(leaf_values))
         for v in t["leaf_values"]:
             leaf_values.append(float(v))
+
+    # NaN comparing false already matches "AsFalse"/"AsIs"; the extra array is
+    # only needed when some feature routes NaN to the true side.
+    any_nan_true = any(split_nan_true)
+    needs_math = mode in ("binary", "multiclass") or any_nan_true
 
     lines: list[str] = [f"package {pkg}", ""]
 
     if needs_math:
         lines += ['import "math"', ""]
+
+    var_lines = [
+        "\tsplitFeature    = []int{" + ", ".join(map(str, split_features)) + "}",
+        "\tsplitBorder     = []float64{"
+        + ", ".join(go_f64(v) for v in split_borders)
+        + "}",
+    ]
+    if any_nan_true:
+        var_lines.append(
+            "\tsplitNanTrue    = []uint8{" + ", ".join(map(str, split_nan_true)) + "}"
+        )
+    var_lines += [
+        "\ttreeSplitOffset = []int{" + ", ".join(map(str, tree_split_offset)) + "}",
+        "\ttreeDepth       = []int{" + ", ".join(map(str, tree_depth)) + "}",
+        "\tleafValues      = []float64{"
+        + ", ".join(go_f64(v) for v in leaf_values)
+        + "}",
+        "\ttreeLeafOffset  = []int{" + ", ".join(map(str, tree_leaf_offset)) + "}",
+    ]
 
     lines += [
         "const (",
@@ -730,28 +961,37 @@ def _write_go_catboost(
         "",
         "//nolint:gochecknoglobals",
         "var (",
-        "\tsplitFeature    = []int{" + ", ".join(map(str, split_features)) + "}",
-        "\tsplitBorder     = []float64{"
-        + ", ".join(go_f64(v) for v in split_borders)
-        + "}",
-        "\ttreeSplitOffset = []int{" + ", ".join(map(str, tree_split_offset)) + "}",
-        "\ttreeDepth       = []int{" + ", ".join(map(str, tree_depth)) + "}",
-        "\tleafValues      = []float64{"
-        + ", ".join(go_f64(v) for v in leaf_values)
-        + "}",
-        "\ttreeLeafOffset  = []int{" + ", ".join(map(str, tree_leaf_offset)) + "}",
+    ] + var_lines + [
         ")",
         "",
-        "// bit l set when feature[split[l]] >= border[split[l]]",
+        "// bit l set when feature[split[l]] > border[split[l]]",
         "func evalTree(treeIdx int, f []float64) float64 {",
         "\tleafIdx := 0",
         "\tsplitOffset := treeSplitOffset[treeIdx]",
         "\tdepth := treeDepth[treeIdx]",
         "\tfor l := 0; l < depth; l++ {",
         "\t\ts := splitOffset + l",
-        "\t\tif f[splitFeature[s]] >= splitBorder[s] {",
-        "\t\t\tleafIdx |= (1 << l)",
-        "\t\t}",
+    ]
+
+    if any_nan_true:
+        lines += [
+            "\t\tv := f[splitFeature[s]]",
+            "\t\tbit := v > splitBorder[s]",
+            "\t\tif math.IsNaN(v) {",
+            "\t\t\tbit = splitNanTrue[s] == 1",
+            "\t\t}",
+            "\t\tif bit {",
+            "\t\t\tleafIdx |= (1 << l)",
+            "\t\t}",
+        ]
+    else:
+        lines += [
+            "\t\tif f[splitFeature[s]] > splitBorder[s] {",
+            "\t\t\tleafIdx |= (1 << l)",
+            "\t\t}",
+        ]
+
+    lines += [
         "\t}",
         "\treturn leafValues[treeLeafOffset[treeIdx]+leafIdx]",
         "}",
