@@ -57,6 +57,152 @@ def go_f32(x: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fail-fast checks
+# ---------------------------------------------------------------------------
+
+
+def _fail(msg: str) -> None:
+    print(f"Error: {msg}")
+    sys.exit(1)
+
+
+def _warn_objective(library: str, objective: str) -> None:
+    print(
+        f"Warning: {library} objective '{objective}' is not in the known-supported "
+        "list; the exported code returns raw tree sums with no output transform. "
+        "Verify predictions against the original model before deploying."
+    )
+
+
+# Objectives whose output transform the generated code reproduces exactly.
+_LGB_KNOWN = {
+    "regression", "regression_l1", "l1", "l2", "rmse", "mae", "mse", "huber",
+    "fair", "quantile", "mape", "binary", "multiclass", "softmax",
+    "lambdarank", "rank_xendcg",
+}
+# Objectives that need an output transform the generated code does NOT apply.
+_LGB_UNSUPPORTED = {
+    "poisson": "exp() output transform",
+    "gamma": "exp() output transform",
+    "tweedie": "exp() output transform",
+    "cross_entropy": "probability labels / sigmoid output",
+    "xentropy": "probability labels / sigmoid output",
+    "cross_entropy_lambda": "log1p(exp()) output transform",
+    "xentlambda": "log1p(exp()) output transform",
+    "multiclassova": "per-class sigmoid instead of softmax",
+    "ova": "per-class sigmoid instead of softmax",
+}
+
+_XGB_KNOWN = {
+    "reg:squarederror", "reg:squaredlogerror", "reg:absoluteerror",
+    "reg:quantileerror", "reg:pseudohubererror", "reg:logistic",
+    "binary:logistic", "binary:hinge", "multi:softprob", "multi:softmax",
+    "rank:pairwise", "rank:ndcg", "rank:map",
+}
+_XGB_UNSUPPORTED = {
+    "count:poisson": "exp() output transform",
+    "reg:gamma": "exp() output transform",
+    "reg:tweedie": "exp() output transform",
+    "binary:logitraw": "raw-margin output that skips the sigmoid",
+    "survival:cox": "exp() output transform",
+    "survival:aft": "AFT output transform",
+}
+
+_CB_KNOWN = {
+    "rmse", "mae", "quantile", "mape", "huber", "expectile", "logloss",
+    "crossentropy", "multiclass",
+}
+_CB_UNSUPPORTED = {
+    "poisson": "exp() output transform",
+    "tweedie": "exp() output transform",
+    "rmsewithuncertainty": "two-dimensional leaf values",
+}
+
+
+def _check_objective(library: str, objective: str) -> None:
+    key = objective.lower()
+    known = {"LightGBM": _LGB_KNOWN, "XGBoost": _XGB_KNOWN, "CatBoost": _CB_KNOWN}[
+        library
+    ]
+    unsupported = {
+        "LightGBM": _LGB_UNSUPPORTED,
+        "XGBoost": _XGB_UNSUPPORTED,
+        "CatBoost": _CB_UNSUPPORTED,
+    }[library]
+    for name, reason in unsupported.items():
+        if key == name or key.startswith(name + ":"):
+            _fail(
+                f"{library} objective '{objective}' is not supported: "
+                f"it requires {reason}, which the generated code does not "
+                "implement. Predictions would silently differ from Python."
+            )
+    if key not in known:
+        _warn_objective(library, objective)
+
+
+def _check_lgb_tree(node: dict[str, Any]) -> None:
+    if "leaf_value" in node:
+        if "leaf_coeff" in node or "leaf_const" in node:
+            _fail(
+                "LightGBM linear trees (linear_tree=true) are not supported: "
+                "leaves hold linear models, not constants."
+            )
+        return
+    dt = str(node.get("decision_type", "<="))
+    if dt != "<=":
+        _fail(
+            f"LightGBM categorical split on feature {node['split_feature']} "
+            f"(decision_type '{dt}') is not supported. Encode categorical "
+            "features numerically before training, or use one-hot encoding."
+        )
+    _check_lgb_tree(node["left_child"])
+    _check_lgb_tree(node["right_child"])
+
+
+def _check_xgb_model(model_json: dict[str, Any]) -> None:
+    booster_name = str(model_json["learner"]["gradient_booster"].get("name", "gbtree"))
+    if booster_name != "gbtree":
+        _fail(
+            f"XGBoost booster '{booster_name}' is not supported (only gbtree). "
+            + (
+                "DART tree weights are not applied by the generated code."
+                if booster_name == "dart"
+                else ""
+            )
+        )
+    trees = model_json["learner"]["gradient_booster"]["model"]["trees"]
+    for i, t in enumerate(trees):
+        if t.get("categories_nodes") or any(int(s) != 0 for s in t.get("split_type", [])):
+            _fail(
+                f"XGBoost categorical split in tree {i} is not supported. "
+                "Train with numerically encoded features "
+                "(enable_categorical=False)."
+            )
+
+
+def _check_cb_model(cb_json: dict[str, Any]) -> None:
+    if "oblivious_trees" not in cb_json:
+        _fail(
+            "CatBoost model does not use symmetric (oblivious) trees. "
+            "Train with grow_policy='SymmetricTree' (the default)."
+        )
+    if cb_json.get("features_info", {}).get("categorical_features"):
+        _fail(
+            "CatBoost categorical features are not supported: their splits "
+            "use learned CTR statistics that the generated code cannot "
+            "reproduce. Encode categorical features numerically instead."
+        )
+    for i, t in enumerate(cb_json["oblivious_trees"]):
+        for s in t["splits"]:
+            stype = str(s.get("split_type", "FloatFeature"))
+            if stype != "FloatFeature" or "float_feature_index" not in s:
+                _fail(
+                    f"CatBoost split of type '{stype}' in tree {i} is not "
+                    "supported (only plain float-feature splits are)."
+                )
+
+
+# ---------------------------------------------------------------------------
 # LightGBM
 # ---------------------------------------------------------------------------
 
@@ -99,6 +245,12 @@ def export_lgbm(
 
     num_class = int(booster.params.get("num_class", 1))
     objective = booster.params.get("objective", "")
+
+    _check_objective(
+        "LightGBM", (objective or str(dump.get("objective", ""))).split(" ")[0]
+    )
+    for t in trees:
+        _check_lgb_tree(t["tree_structure"])
 
     if num_class > 1:
         mode = "multiclass"
@@ -149,6 +301,8 @@ def export_xgb(model_path: str, output: str, class_name: str, lang: str = "cs") 
     with open(model_path, encoding="utf-8") as f:
         model_json: dict[str, Any] = json.load(f)
 
+    _check_xgb_model(model_json)
+
     lmp: dict[str, Any] = model_json["learner"]["learner_model_param"]
     # scalar ("0.5") or, since XGBoost 2.x multiclass, a per-class vector
     # ("[-2.76E-2,5.52E-2,...]")
@@ -158,6 +312,7 @@ def export_xgb(model_path: str, output: str, class_name: str, lang: str = "cs") 
 
     num_class = int(str(lmp.get("num_class", "0")))
     objective = str(model_json["learner"]["objective"]["name"])
+    _check_objective("XGBoost", objective)
 
     if num_class > 1:
         mode = "multiclass"
@@ -280,32 +435,49 @@ def export_cb(model_path: str, output: str, class_name: str, lang: str = "cs") -
     finally:
         os.unlink(tmp_path)
 
+    _check_cb_model(cb_json)
+
     params: dict[str, Any] = cb_json.get("model_info", {}).get("params", {})
     loss: Any = params.get("loss_function", "RMSE")
     if isinstance(loss, dict):
         loss = loss.get("type", "RMSE")
     loss_lower = str(loss).lower()
+    _check_objective("CatBoost", str(loss))
+
+    trees: list[Any] = cb_json["oblivious_trees"]
+    sb: Any = cb_json.get("scale_and_bias", [1.0, [0.0]])
+    scale = float(sb[0]) if isinstance(sb[0], (int, float)) else float(sb[0][0])
+    biases: list[float] = (
+        [float(b) for b in sb[1]] if isinstance(sb[1], list) else [float(sb[1])]
+    )
+
+    if "onevsall" in loss_lower:
+        print(
+            "Error: CatBoost MultiClassOneVsAll is not supported "
+            "(per-class sigmoid instead of softmax)."
+        )
+        sys.exit(1)
 
     if "multiclass" in loss_lower:
         mode = "multiclass"
-        num_class = int(params.get("classes_count", 0))
-        if num_class == 0:
-            num_class = (
-                len(cb_json["oblivious_trees"][0]["leaf_values"])
-                if cb_json["oblivious_trees"]
-                else 2
+        # multiclass leaf_values are vector-valued: 2^depth leaves x K classes,
+        # laid out leaf-major, so K = len(leaf_values) / 2^depth
+        t0 = trees[0]
+        num_class = len(t0["leaf_values"]) // (1 << len(t0["splits"]))
+        if len(biases) == 1:
+            biases = biases * num_class
+        if len(biases) != num_class:
+            print(
+                f"Error: bias vector length {len(biases)} does not match "
+                f"class count {num_class}."
             )
+            sys.exit(1)
     elif "logloss" in loss_lower or "crossentropy" in loss_lower:
         mode = "binary"
         num_class = 1
     else:
         mode = "regression"
         num_class = 1
-
-    trees: list[Any] = cb_json["oblivious_trees"]
-    sb: Any = cb_json.get("scale_and_bias", [1.0, [0.0]])
-    scale = float(sb[0]) if isinstance(sb[0], (int, float)) else float(sb[0][0])
-    bias = float(sb[1][0]) if isinstance(sb[1], list) else float(sb[1])
 
     # NaN routing per float feature: "AsTrue" sets the split bit for NaN,
     # "AsFalse"/"AsIs" leave it unset (v > border is false for NaN anyway).
@@ -316,13 +488,13 @@ def export_cb(model_path: str, output: str, class_name: str, lang: str = "cs") -
 
     if lang == "go":
         _write_go_catboost(
-            trees, scale, bias, class_name, output, mode=mode,
-            nan_true_by_feature=nan_true_by_feature,
+            trees, scale, biases, class_name, output, mode=mode,
+            num_class=num_class, nan_true_by_feature=nan_true_by_feature,
         )
     else:
         _write_cs_catboost(
-            trees, scale, bias, class_name, output, mode=mode,
-            nan_true_by_feature=nan_true_by_feature,
+            trees, scale, biases, class_name, output, mode=mode,
+            num_class=num_class, nan_true_by_feature=nan_true_by_feature,
         )
 
     _print_summary(
@@ -332,7 +504,7 @@ def export_cb(model_path: str, output: str, class_name: str, lang: str = "cs") -
         len(trees),
         0,
         output,
-        extra=f"scale={scale}  bias={bias}",
+        extra=f"scale={scale}  bias={biases if mode == 'multiclass' else biases[0]}",
     )
 
 
@@ -613,11 +785,11 @@ def _cs_predict_methods(
 def _write_cs_catboost(
     trees: list[Any],
     scale: float,
-    bias: float,
+    biases: list[float],
     class_name: str,
     output: str,
     mode: str = "regression",
-    _num_class: int = 1,
+    num_class: int = 1,
     nan_true_by_feature: dict[int, bool] | None = None,
 ) -> None:
     nan_true_by_feature = nan_true_by_feature or {}
@@ -654,7 +826,19 @@ def _write_cs_catboost(
         "{",
         f"    private const int    TreeCount = {len(trees)};",
         f"    private const double Scale     = {f64(scale)};",
-        f"    private const double Bias      = {f64(bias)};",
+    ]
+
+    if mode == "multiclass":
+        lines.append(f"    private const int    NumClasses = {num_class};")
+        lines.append(
+            "    private static readonly double[] Bias = ["
+            + ", ".join(f64(b) for b in biases)
+            + "];"
+        )
+    else:
+        lines.append(f"    private const double Bias      = {f64(biases[0])};")
+
+    lines += [
         "",
         "    private static readonly int[]    SplitFeature    = ["
         + ", ".join(map(str, split_features))
@@ -685,37 +869,98 @@ def _write_cs_catboost(
         + ", ".join(map(str, tree_leaf_offset))
         + "];",
         "",
-        "    // bit l set when feature[split[l]] > border[split[l]]",
-        "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
-        "    private static double EvalTree(int treeIdx, ReadOnlySpan<double> f)",
-        "    {",
-        "        int leafIdx     = 0;",
-        "        int splitOffset = TreeSplitOffset[treeIdx];",
-        "        int depth       = TreeDepth[treeIdx];",
-        "        for (int l = 0; l < depth; l++)",
-        "        {",
-        "            int s = splitOffset + l;",
     ]
 
+    # split condition shared by both tree walkers (NaN-aware when needed)
     if any_nan_true:
-        lines += [
+        split_cond = [
             "            double v = f[SplitFeature[s]];",
             "            bool bit = double.IsNaN(v) ? SplitNanTrue[s] == 1 : v > SplitBorder[s];",
             "            if (bit)",
             "                leafIdx |= (1 << l);",
         ]
     else:
-        lines += [
+        split_cond = [
             "            if (f[SplitFeature[s]] > SplitBorder[s])",
             "                leafIdx |= (1 << l);",
         ]
 
-    lines += [
-        "        }",
-        "        return LeafValues[TreeLeafOffset[treeIdx] + leafIdx];",
-        "    }",
-        "",
-    ]
+    if mode == "multiclass":
+        # multiclass leaves are vectors: LeafValues[base + c] for class c
+        lines += [
+            "    // bit l set when feature[split[l]] > border[split[l]]",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    private static int LeafBase(int treeIdx, ReadOnlySpan<double> f)",
+            "    {",
+            "        int leafIdx     = 0;",
+            "        int splitOffset = TreeSplitOffset[treeIdx];",
+            "        int depth       = TreeDepth[treeIdx];",
+            "        for (int l = 0; l < depth; l++)",
+            "        {",
+            "            int s = splitOffset + l;",
+        ] + split_cond + [
+            "        }",
+            "        return TreeLeafOffset[treeIdx] + leafIdx * NumClasses;",
+            "    }",
+            "",
+        ]
+    else:
+        lines += [
+            "    // bit l set when feature[split[l]] > border[split[l]]",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    private static double EvalTree(int treeIdx, ReadOnlySpan<double> f)",
+            "    {",
+            "        int leafIdx     = 0;",
+            "        int splitOffset = TreeSplitOffset[treeIdx];",
+            "        int depth       = TreeDepth[treeIdx];",
+            "        for (int l = 0; l < depth; l++)",
+            "        {",
+            "            int s = splitOffset + l;",
+        ] + split_cond + [
+            "        }",
+            "        return LeafValues[TreeLeafOffset[treeIdx] + leafIdx];",
+            "    }",
+            "",
+        ]
+
+    if mode == "multiclass":
+        lines += [
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static double[] PredictScores(ReadOnlySpan<double> f)",
+            "    {",
+            "        double[] s = new double[NumClasses];",
+            "        for (int i = 0; i < TreeCount; i++)",
+            "        {",
+            "            int b = LeafBase(i, f);",
+            "            for (int c = 0; c < NumClasses; c++)",
+            "                s[c] += LeafValues[b + c];",
+            "        }",
+            "        for (int c = 0; c < NumClasses; c++)",
+            "            s[c] = Bias[c] + Scale * s[c];",
+            "        return s;",
+            "    }",
+            "",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static double[] Predict(ReadOnlySpan<double> f)",
+            "    {",
+            "        double[] s = PredictScores(f);",
+            "        double max = s[0];",
+            "        for (int i = 1; i < s.Length; i++) if (s[i] > max) max = s[i];",
+            "        double sum = 0;",
+            "        for (int i = 0; i < s.Length; i++) { s[i] = Math.Exp(s[i] - max); sum += s[i]; }",
+            "        for (int i = 0; i < s.Length; i++) s[i] /= sum;",
+            "        return s;",
+            "    }",
+            "",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static int PredictClass(ReadOnlySpan<double> f)",
+            "    {",
+            "        double[] p = PredictScores(f);",
+            "        int best = 0;",
+            "        for (int i = 1; i < p.Length; i++) if (p[i] > p[best]) best = i;",
+            "        return best;",
+            "    }",
+        ]
 
     if mode == "regression":
         lines += [
@@ -946,11 +1191,11 @@ def _write_go_node_array(
 def _write_go_catboost(
     trees: list[Any],
     scale: float,
-    bias: float,
+    biases: list[float],
     class_name: str,
     output: str,
     mode: str = "regression",
-    _num_class: int = 1,
+    num_class: int = 1,
     nan_true_by_feature: dict[int, bool] | None = None,
 ) -> None:
     pkg = class_name.lower()
@@ -987,7 +1232,28 @@ def _write_go_catboost(
     if needs_math:
         lines += ['import "math"', ""]
 
-    var_lines = [
+    # gofmt aligns '=' within const/var blocks
+    if mode == "multiclass":
+        const_lines = [
+            f"\ttreeCount  = {len(trees)}",
+            f"\tscale      = {go_f64(scale)}",
+            f"\tnumClasses = {num_class}",
+        ]
+    else:
+        const_lines = [
+            f"\ttreeCount = {len(trees)}",
+            f"\tscale     = {go_f64(scale)}",
+            f"\tbias      = {go_f64(biases[0])}",
+        ]
+
+    var_lines: list[str] = []
+    if mode == "multiclass":
+        var_lines.append(
+            "\tbias            = []float64{"
+            + ", ".join(go_f64(b) for b in biases)
+            + "}"
+        )
+    var_lines += [
         "\tsplitFeature    = []int{" + ", ".join(map(str, split_features)) + "}",
         "\tsplitBorder     = []float64{"
         + ", ".join(go_f64(v) for v in split_borders)
@@ -1006,29 +1272,12 @@ def _write_go_catboost(
         "\ttreeLeafOffset  = []int{" + ", ".join(map(str, tree_leaf_offset)) + "}",
     ]
 
-    lines += [
-        "const (",
-        f"\ttreeCount = {len(trees)}",
-        f"\tscale     = {go_f64(scale)}",
-        f"\tbias      = {go_f64(bias)}",
-        ")",
-        "",
-        "//nolint:gochecknoglobals",
-        "var (",
-    ] + var_lines + [
-        ")",
-        "",
-        "// bit l set when feature[split[l]] > border[split[l]]",
-        "func evalTree(treeIdx int, f []float64) float64 {",
-        "\tleafIdx := 0",
-        "\tsplitOffset := treeSplitOffset[treeIdx]",
-        "\tdepth := treeDepth[treeIdx]",
-        "\tfor l := 0; l < depth; l++ {",
-        "\t\ts := splitOffset + l",
-    ]
+    lines += ["const ("] + const_lines + [")", ""]
+    lines += ["//nolint:gochecknoglobals", "var ("] + var_lines + [")", ""]
 
+    # split condition shared by both tree walkers (NaN-aware when needed)
     if any_nan_true:
-        lines += [
+        split_cond = [
             "\t\tv := f[splitFeature[s]]",
             "\t\tbit := v > splitBorder[s]",
             "\t\tif math.IsNaN(v) {",
@@ -1039,18 +1288,93 @@ def _write_go_catboost(
             "\t\t}",
         ]
     else:
-        lines += [
+        split_cond = [
             "\t\tif f[splitFeature[s]] > splitBorder[s] {",
             "\t\t\tleafIdx |= (1 << l)",
             "\t\t}",
         ]
 
-    lines += [
-        "\t}",
-        "\treturn leafValues[treeLeafOffset[treeIdx]+leafIdx]",
-        "}",
-        "",
-    ]
+    if mode == "multiclass":
+        # multiclass leaves are vectors: leafValues[base + c] for class c
+        lines += [
+            "// bit l set when feature[split[l]] > border[split[l]]",
+            "func leafBase(treeIdx int, f []float64) int {",
+            "\tleafIdx := 0",
+            "\tsplitOffset := treeSplitOffset[treeIdx]",
+            "\tdepth := treeDepth[treeIdx]",
+            "\tfor l := 0; l < depth; l++ {",
+            "\t\ts := splitOffset + l",
+        ] + split_cond + [
+            "\t}",
+            "\treturn treeLeafOffset[treeIdx] + leafIdx*numClasses",
+            "}",
+            "",
+        ]
+    else:
+        lines += [
+            "// bit l set when feature[split[l]] > border[split[l]]",
+            "func evalTree(treeIdx int, f []float64) float64 {",
+            "\tleafIdx := 0",
+            "\tsplitOffset := treeSplitOffset[treeIdx]",
+            "\tdepth := treeDepth[treeIdx]",
+            "\tfor l := 0; l < depth; l++ {",
+            "\t\ts := splitOffset + l",
+        ] + split_cond + [
+            "\t}",
+            "\treturn leafValues[treeLeafOffset[treeIdx]+leafIdx]",
+            "}",
+            "",
+        ]
+
+    if mode == "multiclass":
+        lines += [
+            "// PredictScores returns raw per-class scores (RawFormulaVal).",
+            "func PredictScores(f []float64) []float64 {",
+            "\ts := make([]float64, numClasses)",
+            "\tfor i := 0; i < treeCount; i++ {",
+            "\t\tb := leafBase(i, f)",
+            "\t\tfor c := 0; c < numClasses; c++ {",
+            "\t\t\ts[c] += leafValues[b+c]",
+            "\t\t}",
+            "\t}",
+            "\tfor c := 0; c < numClasses; c++ {",
+            "\t\ts[c] = bias[c] + scale*s[c]",
+            "\t}",
+            "\treturn s",
+            "}",
+            "",
+            "// Predict returns softmax probabilities over all classes.",
+            "func Predict(f []float64) []float64 {",
+            "\ts := PredictScores(f)",
+            "\tmax := s[0]",
+            "\tfor _, v := range s {",
+            "\t\tif v > max {",
+            "\t\t\tmax = v",
+            "\t\t}",
+            "\t}",
+            "\tsum := 0.0",
+            "\tfor i := range s {",
+            "\t\ts[i] = math.Exp(s[i] - max)",
+            "\t\tsum += s[i]",
+            "\t}",
+            "\tfor i := range s {",
+            "\t\ts[i] /= sum",
+            "\t}",
+            "\treturn s",
+            "}",
+            "",
+            "// PredictClass returns the class index with the highest score.",
+            "func PredictClass(f []float64) int {",
+            "\tp := PredictScores(f)",
+            "\tbest := 0",
+            "\tfor i := range p {",
+            "\t\tif p[i] > p[best] {",
+            "\t\t\tbest = i",
+            "\t\t}",
+            "\t}",
+            "\treturn best",
+            "}",
+        ]
 
     if mode == "regression":
         lines += [
@@ -1162,24 +1486,29 @@ def _go_predict_methods(
         "\ts := PredictScores(f)",
         "\tmax := s[0]",
         "\tfor _, v := range s {",
-        "\t\tif v > max { max = v }",
+        "\t\tif v > max {",
+        "\t\t\tmax = v",
+        "\t\t}",
         "\t}",
         "\tsum := 0.0",
         "\tfor i := range s {",
         "\t\ts[i] = math.Exp(s[i] - max)",
         "\t\tsum += s[i]",
         "\t}",
-        "\tfor i := range s { s[i] /= sum }",
+        "\tfor i := range s {",
+        "\t\ts[i] /= sum",
+        "\t}",
         "\treturn s",
         "}",
         "",
         "// PredictClass returns the class index with the highest probability.",
         "func PredictClass(f []float64) int {",
-        "\tp := Predict(f)",
+        "\tp := PredictScores(f)",
         "\tbest := 0",
-        "\tfor i, v := range p {",
-        "\t\tif v > p[best] { best = i }",
-        "\t\t_ = v",
+        "\tfor i := range p {",
+        "\t\tif p[i] > p[best] {",
+        "\t\t\tbest = i",
+        "\t\t}",
         "\t}",
         "\treturn best",
         "}",
@@ -1195,7 +1524,8 @@ def _write_file(path: str, content: str) -> None:
     outdir = os.path.dirname(path)
     if outdir:
         os.makedirs(outdir, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
+    # LF newlines so output is identical on Windows and Unix (gofmt requires LF)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
         _ = fh.write(content)
 
 
