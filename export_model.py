@@ -135,11 +135,17 @@ def export_lgbm(
 
 
 def export_xgb(model_path: str, output: str, class_name: str, lang: str = "cs") -> None:
+    import math
+
     with open(model_path, encoding="utf-8") as f:
         model_json: dict[str, Any] = json.load(f)
 
     lmp: dict[str, Any] = model_json["learner"]["learner_model_param"]
-    base_score = float(str(lmp["base_score"]).strip("[]"))
+    # scalar ("0.5") or, since XGBoost 2.x multiclass, a per-class vector
+    # ("[-2.76E-2,5.52E-2,...]")
+    base_scores = [
+        float(v) for v in str(lmp["base_score"]).strip("[]").split(",")
+    ]
 
     num_class = int(str(lmp.get("num_class", "0")))
     objective = str(model_json["learner"]["objective"]["name"])
@@ -151,15 +157,33 @@ def export_xgb(model_path: str, output: str, class_name: str, lang: str = "cs") 
     else:
         mode = "regression"
 
+    # XGBoost stores base_score in the objective's *output* space and starts
+    # the margin sum from ProbToMargin(base_score):
+    #   logistic objectives -> logit(p); squared error etc. -> identity.
+    # XGBoost >= 2.0 auto-estimates base_score from the training labels, so
+    # for binary models it is a real probability, not the neutral 0.5.
+    class_base: list[float] | None = None
+    if mode == "binary":
+        p = base_scores[0]
+        if not 0.0 < p < 1.0:
+            print(f"Error: cannot convert base_score={p} to a logit.")
+            sys.exit(1)
+        effective_base = math.log(p / (1.0 - p))
+    elif mode == "multiclass":
+        # per-class raw margins, added to each class score
+        if len(base_scores) == 1:
+            base_scores = base_scores * num_class
+        class_base = base_scores
+        effective_base = 0.0
+    else:
+        effective_base = base_scores[0]
+
     raw_trees: list[Any] = model_json["learner"]["gradient_booster"]["model"]["trees"]
 
     nodes: list[_Node] = []
     roots: list[int] = []
     for t in raw_trees:
         roots.append(_flatten_xgb_flat(t, nodes))
-
-    # multiclass XGBoost auto base_score is per-class and folded in; omit it
-    effective_base = base_score if mode != "multiclass" else 0.0
 
     if lang == "go":
         _write_go_node_array(
@@ -171,6 +195,7 @@ def export_xgb(model_path: str, output: str, class_name: str, lang: str = "cs") 
             xgboost=True,
             mode=mode,
             num_class=num_class,
+            class_base=class_base,
         )
     else:
         _write_cs_node_array(
@@ -182,6 +207,7 @@ def export_xgb(model_path: str, output: str, class_name: str, lang: str = "cs") 
             xgboost=True,
             mode=mode,
             num_class=num_class,
+            class_base=class_base,
         )
 
     _print_summary(
@@ -191,7 +217,7 @@ def export_xgb(model_path: str, output: str, class_name: str, lang: str = "cs") 
         len(raw_trees),
         len(nodes),
         output,
-        extra=f"base_score={base_score}",
+        extra=f"base_score={lmp['base_score']}",
     )
 
 
@@ -303,7 +329,9 @@ def _write_cs_node_array(
     xgboost: bool = False,
     mode: str = "regression",
     num_class: int = 1,
+    class_base: list[float] | None = None,
 ) -> None:
+    has_class_base = class_base is not None and any(v != 0.0 for v in class_base)
     feature: list[int] = []
     threshold: list[float] = []
     left_arr: list[int] = []
@@ -354,6 +382,14 @@ def _write_cs_node_array(
     if base_score != 0.0:
         lines.append(f"    private const double BaseScore = {f64(base_score)};")
 
+    if has_class_base:
+        assert class_base is not None
+        lines.append(
+            "    private static readonly double[] ClassBase = ["
+            + ", ".join(f64(v) for v in class_base)
+            + "];"
+        )
+
     lines += [
         "",
         "    private static readonly int[]    Feature   = ["
@@ -390,13 +426,15 @@ def _write_cs_node_array(
         "",
     ]
 
-    lines += _cs_predict_methods(mode, base_score, num_class)
+    lines += _cs_predict_methods(mode, base_score, num_class, has_class_base)
     lines.append("}")
 
     _write_file(output, "\n".join(lines) + "\n")
 
 
-def _cs_predict_methods(mode: str, base_score: float, _num_class: int) -> list[str]:
+def _cs_predict_methods(
+    mode: str, base_score: float, _num_class: int, has_class_base: bool = False
+) -> list[str]:
     init = "BaseScore" if base_score != 0.0 else "0"
 
     if mode == "regression":
@@ -437,11 +475,16 @@ def _cs_predict_methods(mode: str, base_score: float, _num_class: int) -> list[s
         ]
 
     # multiclass
+    scores_init = (
+        "        double[] s = (double[])ClassBase.Clone();"
+        if has_class_base
+        else "        double[] s = new double[NumClasses];"
+    )
     return [
         "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
         "    public static double[] PredictScores(ReadOnlySpan<double> f)",
         "    {",
-        "        double[] s = new double[NumClasses];",
+        scores_init,
         "        for (int c = 0; c < NumClasses; c++)",
         "            for (int i = 0; i < TreesPerClass; i++)",
         "                s[c] += Eval(Roots[c + i * NumClasses], f);",
@@ -602,9 +645,11 @@ def _write_go_node_array(
     xgboost: bool = False,
     mode: str = "regression",
     num_class: int = 1,
+    class_base: list[float] | None = None,
 ) -> None:
     pkg = class_name.lower()
     needs_math = mode in ("binary", "multiclass")
+    has_class_base = class_base is not None and any(v != 0.0 for v in class_base)
 
     feature: list[int] = []
     threshold: list[float] = []
@@ -650,10 +695,20 @@ def _write_go_node_array(
 
     lines += ["const ("] + const_lines + [")", ""]
 
+    class_base_line: list[str] = []
+    if has_class_base:
+        assert class_base is not None
+        class_base_line = [
+            "\tclassBase = []float64{"
+            + ", ".join(go_f64(v) for v in class_base)
+            + "}"
+        ]
+
     # var block
     lines += [
         "//nolint:gochecknoglobals",
         "var (",
+    ] + class_base_line + [
         "\tfeature   = []int{" + ", ".join(map(str, feature)) + "}",
         "\tthreshold = []" + thr_type + "{" + thr_vals + "}",
         "\tleft      = []int{" + ", ".join(map(str, left_arr)) + "}",
@@ -682,7 +737,7 @@ def _write_go_node_array(
         "",
     ]
 
-    lines += _go_predict_methods(mode, base_score, num_class)
+    lines += _go_predict_methods(mode, base_score, num_class, has_class_base)
     _write_file(output, "\n".join(lines) + "\n")
 
 
@@ -801,7 +856,9 @@ def _write_go_catboost(
     _write_file(output, "\n".join(lines) + "\n")
 
 
-def _go_predict_methods(mode: str, base_score: float, _num_class: int) -> list[str]:
+def _go_predict_methods(
+    mode: str, base_score: float, _num_class: int, has_class_base: bool = False
+) -> list[str]:
     init = "baseScore" if base_score != 0.0 else "0.0"
 
     if mode == "regression":
@@ -846,10 +903,13 @@ def _go_predict_methods(mode: str, base_score: float, _num_class: int) -> list[s
         ]
 
     # multiclass
+    scores_init = ["\ts := make([]float64, numClasses)"]
+    if has_class_base:
+        scores_init.append("\tcopy(s, classBase)")
     return [
         "// PredictScores returns raw per-class scores.",
         "func PredictScores(f []float64) []float64 {",
-        "\ts := make([]float64, numClasses)",
+    ] + scores_init + [
         "\tfor c := 0; c < numClasses; c++ {",
         "\t\tfor i := 0; i < treesPerClass; i++ {",
         "\t\t\ts[c] += eval(roots[c+i*numClasses], f)",
