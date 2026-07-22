@@ -1,2 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# LightGBM model files must keep LF line endings: LightGBM cannot parse a
+# CRLF model file, so a Windows checkout with autocrlf would break the demo.
+demo/*.txt text eol=lf
+
+# Saved model binaries
+*.cbm binary
