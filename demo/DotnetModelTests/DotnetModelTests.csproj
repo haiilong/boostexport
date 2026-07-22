@@ -19,8 +19,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="../data.csv"              CopyToOutputDirectory="Always" Link="data.csv" />
-    <None Include="../predictions_train.csv" CopyToOutputDirectory="Always" Link="predictions_train.csv" />
+    <None Include="../data*.csv"        CopyToOutputDirectory="Always" Link="%(Filename)%(Extension)" />
+    <None Include="../predictions*.csv" CopyToOutputDirectory="Always" Link="%(Filename)%(Extension)" />
   </ItemGroup>
 
 </Project>
