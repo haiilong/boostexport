@@ -1,5 +1,7 @@
 package lgbm
 
+import "math"
+
 const (
 	treeCount = 50
 )
@@ -20,7 +22,11 @@ func eval(node int, f []float64) float64 {
 		if left[node] < 0 {
 			return value[node]
 		}
-		if f[feature[node]] <= threshold[node] {
+		v := f[feature[node]]
+		if math.IsNaN(v) {
+			v = 0.0
+		}
+		if v <= threshold[node] {
 			node = left[node]
 		} else {
 			node = right[node]

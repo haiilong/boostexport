@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  export-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install exporter dependencies
+        run: pip install xgboost lightgbm catboost scikit-learn numpy pandas
+
+      # Retrain from scratch so CI also catches model-format drift in new
+      # library releases, then re-export everything with the current exporter.
+      - name: Train models
+        working-directory: demo
+        run: python create_models.py
+
+      - name: Export to C# and Go
+        working-directory: demo
+        run: |
+          python generate_cs.py
+          python generate_go.py
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: C# tests (with coverage)
+        run: >
+          dotnet test demo/DotnetModelTests
+          --collect:"XPlat Code Coverage"
+          --results-directory coverage-cs
+          --logger "console;verbosity=normal"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Generated Go code is gofmt-clean
+        working-directory: demo/GoModelTests
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:" && echo "$unformatted" && exit 1
+          fi
+
+      - name: Go tests (with coverage)
+        working-directory: demo/GoModelTests
+        run: |
+          go test ./... -v -coverpkg=./... -coverprofile=coverage.out
+          go tool cover -func=coverage.out | tail -5
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage-cs
+            demo/GoModelTests/coverage.out
+          if-no-files-found: ignore

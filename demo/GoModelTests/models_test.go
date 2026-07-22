@@ -2,117 +2,195 @@ package gomodeltests_test
 
 import (
 	"encoding/csv"
-	"fmt"
 	"math"
 	"os"
 	"strconv"
 	"testing"
 
 	"gomodeltests/cb"
+	"gomodeltests/cbbin"
+	"gomodeltests/cbmulti"
+	"gomodeltests/cbnan"
 	"gomodeltests/lgbm"
+	"gomodeltests/lgbmbin"
+	"gomodeltests/lgbmmulti"
+	"gomodeltests/lgbmnan"
 	"gomodeltests/xgb"
+	"gomodeltests/xgbbin"
+	"gomodeltests/xgbmulti"
+	"gomodeltests/xgbnan"
 )
 
+// LightGBM and CatBoost evaluate in float64 end-to-end, so the generated
+// code matches Python almost exactly. XGBoost accumulates leaf values in
+// float32 internally, so its tolerance is wider.
 const (
-	dataFile  = "../data.csv"
-	predFile  = "../predictions_train.csv"
-	tolerance = 1e-4
+	tolExact     = 1e-9
+	tolXgb       = 1e-4
+	tolProba     = 1e-6
+	featureCount = 10
 )
 
-type row struct {
-	features []float64
-	predLgb  float64
-	predXgb  float64
-	predCb   float64
-}
-
-func loadData(t *testing.T) []row {
+func loadCSV(t *testing.T, path string) ([][]float64, map[string]int) {
 	t.Helper()
-
-	fh, err := os.Open(dataFile)
+	fh, err := os.Open(path)
 	if err != nil {
-		t.Fatalf("open data.csv: %v", err)
+		t.Fatalf("open %s: %v", path, err)
 	}
 	defer fh.Close()
-	dataRows, err := csv.NewReader(fh).ReadAll()
+	rows, err := csv.NewReader(fh).ReadAll()
 	if err != nil {
-		t.Fatalf("read data.csv: %v", err)
+		t.Fatalf("read %s: %v", path, err)
 	}
-
-	ph, err := os.Open(predFile)
-	if err != nil {
-		t.Fatalf("open predictions_train.csv: %v", err)
+	cols := make(map[string]int, len(rows[0]))
+	for i, h := range rows[0] {
+		cols[h] = i
 	}
-	defer ph.Close()
-	predRows, err := csv.NewReader(ph).ReadAll()
-	if err != nil {
-		t.Fatalf("read predictions_train.csv: %v", err)
-	}
-
-	// data.csv header: f0, f1, ..., f9, label  (features cols 0-9)
-	// predictions_train.csv header: label, pred_xgb, pred_lgb, pred_cb
-	var rows []row
-	for i := 1; i < len(dataRows); i++ {
-		dr := dataRows[i]
-		pr := predRows[i]
-
-		feats := make([]float64, 10)
-		for j := 0; j < 10; j++ {
-			feats[j], _ = strconv.ParseFloat(dr[j], 64)
+	out := make([][]float64, len(rows)-1)
+	for i, r := range rows[1:] {
+		out[i] = make([]float64, len(r))
+		for j, s := range r {
+			v, err := strconv.ParseFloat(s, 64) // "NaN" parses to NaN
+			if err != nil {
+				t.Fatalf("%s row %d col %d: %v", path, i, j, err)
+			}
+			out[i][j] = v
 		}
-		predXgb, _ := strconv.ParseFloat(pr[1], 64)
-		predLgb, _ := strconv.ParseFloat(pr[2], 64)
-		predCb, _ := strconv.ParseFloat(pr[3], 64)
-
-		rows = append(rows, row{feats, predLgb, predXgb, predCb})
 	}
-	return rows
+	return out, cols
 }
 
-func TestLgbmModel_MatchesPython(t *testing.T) {
-	rows := loadData(t)
-	maxDiff := 0.0
+func features(rows [][]float64) [][]float64 {
+	out := make([][]float64, len(rows))
 	for i, r := range rows {
-		got := lgbm.Predict(r.features)
-		diff := math.Abs(got - r.predLgb)
+		out[i] = r[:featureCount]
+	}
+	return out
+}
+
+func verify(t *testing.T, label string, X [][]float64, expected [][]float64,
+	col int, predict func([]float64) float64, tol float64) {
+	t.Helper()
+	maxDiff := 0.0
+	for i, f := range X {
+		diff := math.Abs(predict(f) - expected[i][col])
 		if diff > maxDiff {
 			maxDiff = diff
 		}
-		if diff > tolerance {
-			t.Errorf("row %d: got %.6f, want %.6f, diff %.2e", i, got, r.predLgb, diff)
+		if diff > tol {
+			t.Errorf("%s row %d: got %.10g, want %.10g, diff %.2e",
+				label, i, predict(f), expected[i][col], diff)
 		}
 	}
-	fmt.Printf("LgbmModel  max diff: %.2e  (%d rows)\n", maxDiff, len(rows))
+	t.Logf("%s: %d rows OK, max diff %.2e", label, len(X), maxDiff)
 }
 
-func TestXgbModel_MatchesPython(t *testing.T) {
-	rows := loadData(t)
-	maxDiff := 0.0
-	for i, r := range rows {
-		got := xgb.Predict(r.features)
-		diff := math.Abs(got - r.predXgb)
-		if diff > maxDiff {
-			maxDiff = diff
-		}
-		if diff > tolerance {
-			t.Errorf("row %d: got %.6f, want %.6f, diff %.2e", i, got, r.predXgb, diff)
-		}
-	}
-	fmt.Printf("XgbModel   max diff: %.2e  (%d rows)\n", maxDiff, len(rows))
+// ------------------------------------------------------------------
+// Regression
+// ------------------------------------------------------------------
+
+func TestRegression(t *testing.T) {
+	data, _ := loadCSV(t, "../data.csv")
+	preds, cols := loadCSV(t, "../predictions_train.csv")
+	X := features(data)
+	verify(t, "regression/lgb", X, preds, cols["pred_lgb"], lgbm.Predict, tolExact)
+	verify(t, "regression/xgb", X, preds, cols["pred_xgb"], xgb.Predict, tolXgb)
+	verify(t, "regression/cb", X, preds, cols["pred_cb"], cb.Predict, tolExact)
 }
 
-func TestCbModel_MatchesPython(t *testing.T) {
-	rows := loadData(t)
-	maxDiff := 0.0
-	for i, r := range rows {
-		got := cb.Predict(r.features)
-		diff := math.Abs(got - r.predCb)
-		if diff > maxDiff {
-			maxDiff = diff
-		}
-		if diff > tolerance {
-			t.Errorf("row %d: got %.6f, want %.6f, diff %.2e", i, got, r.predCb, diff)
+// ------------------------------------------------------------------
+// Binary classification: raw score and probability
+// ------------------------------------------------------------------
+
+func TestBinaryScore(t *testing.T) {
+	data, _ := loadCSV(t, "../data_binary.csv")
+	preds, cols := loadCSV(t, "../predictions_binary.csv")
+	X := features(data)
+	verify(t, "binary-score/lgb", X, preds, cols["score_lgb"], lgbmbin.PredictScore, tolExact)
+	verify(t, "binary-score/xgb", X, preds, cols["score_xgb"], xgbbin.PredictScore, tolXgb)
+	verify(t, "binary-score/cb", X, preds, cols["score_cb"], cbbin.PredictScore, tolExact)
+}
+
+func TestBinaryProbability(t *testing.T) {
+	data, _ := loadCSV(t, "../data_binary.csv")
+	preds, cols := loadCSV(t, "../predictions_binary.csv")
+	X := features(data)
+	verify(t, "binary-proba/lgb", X, preds, cols["proba_lgb"], lgbmbin.PredictProbability, tolProba)
+	verify(t, "binary-proba/xgb", X, preds, cols["proba_xgb"], xgbbin.PredictProbability, tolProba)
+	verify(t, "binary-proba/cb", X, preds, cols["proba_cb"], cbbin.PredictProbability, tolProba)
+}
+
+// ------------------------------------------------------------------
+// Multiclass classification: per-class probabilities + argmax label
+// ------------------------------------------------------------------
+
+func TestMulticlassProbabilities(t *testing.T) {
+	data, _ := loadCSV(t, "../data_multi.csv")
+	preds, cols := loadCSV(t, "../predictions_multi.csv")
+	X := features(data)
+	models := map[string]func([]float64) []float64{
+		"lgb": lgbmmulti.Predict,
+		"xgb": xgbmulti.Predict,
+		"cb":  cbmulti.Predict,
+	}
+	for lib, predict := range models {
+		for c := 0; c < 3; c++ {
+			cc := c
+			verify(t, "multi-proba/"+lib, X, preds, cols["proba_"+lib+"_"+strconv.Itoa(c)],
+				func(f []float64) float64 { return predict(f)[cc] }, tolProba)
 		}
 	}
-	fmt.Printf("CbModel    max diff: %.2e  (%d rows)\n", maxDiff, len(rows))
+}
+
+func TestMulticlassLabel(t *testing.T) {
+	data, _ := loadCSV(t, "../data_multi.csv")
+	X := features(data)
+	models := map[string]struct {
+		proba func([]float64) []float64
+		label func([]float64) int
+	}{
+		"lgb": {lgbmmulti.Predict, lgbmmulti.PredictClass},
+		"xgb": {xgbmulti.Predict, xgbmulti.PredictClass},
+		"cb":  {cbmulti.Predict, cbmulti.PredictClass},
+	}
+	for lib, m := range models {
+		for i, f := range X {
+			p := m.proba(f)
+			best := 0
+			for j := range p {
+				if p[j] > p[best] {
+					best = j
+				}
+			}
+			if got := m.label(f); got != best {
+				t.Errorf("%s row %d: PredictClass=%d, argmax=%d", lib, i, got, best)
+			}
+		}
+	}
+}
+
+// ------------------------------------------------------------------
+// Regression with missing values (NaN routing)
+// ------------------------------------------------------------------
+
+func TestNanRegression(t *testing.T) {
+	data, _ := loadCSV(t, "../data_nan.csv")
+	preds, cols := loadCSV(t, "../predictions_nan.csv")
+	X := features(data)
+
+	hasNaN := false
+	for _, r := range X {
+		for _, v := range r {
+			if math.IsNaN(v) {
+				hasNaN = true
+			}
+		}
+	}
+	if !hasNaN {
+		t.Fatal("data_nan.csv contains no NaN values; test would be vacuous")
+	}
+
+	verify(t, "nan/lgb", X, preds, cols["pred_lgb"], lgbmnan.Predict, tolExact)
+	verify(t, "nan/xgb", X, preds, cols["pred_xgb"], xgbnan.Predict, tolXgb)
+	verify(t, "nan/cb", X, preds, cols["pred_cb"], cbnan.Predict, tolExact)
 }

@@ -640,11 +640,15 @@ def _write_go_node_array(
     if needs_math:
         lines += ['import "math"', ""]
 
-    # const block
-    const_lines = [f"\ttreeCount = {len(roots)}"]
+    # const block (gofmt aligns '=' within a block)
     if mode == "multiclass":
-        const_lines.append(f"\tnumClasses   = {num_class}")
-        const_lines.append("\ttreesPerClass = treeCount / numClasses")
+        const_lines = [
+            f"\ttreeCount     = {len(roots)}",
+            f"\tnumClasses    = {num_class}",
+            "\ttreesPerClass = treeCount / numClasses",
+        ]
+    else:
+        const_lines = [f"\ttreeCount = {len(roots)}"]
     if base_score != 0.0:
         const_lines.append(f"\tbaseScore = {go_f64(base_score)}")
 
@@ -863,24 +867,29 @@ def _go_predict_methods(mode: str, base_score: float, _num_class: int) -> list[s
         "\ts := PredictScores(f)",
         "\tmax := s[0]",
         "\tfor _, v := range s {",
-        "\t\tif v > max { max = v }",
+        "\t\tif v > max {",
+        "\t\t\tmax = v",
+        "\t\t}",
         "\t}",
         "\tsum := 0.0",
         "\tfor i := range s {",
         "\t\ts[i] = math.Exp(s[i] - max)",
         "\t\tsum += s[i]",
         "\t}",
-        "\tfor i := range s { s[i] /= sum }",
+        "\tfor i := range s {",
+        "\t\ts[i] /= sum",
+        "\t}",
         "\treturn s",
         "}",
         "",
         "// PredictClass returns the class index with the highest probability.",
         "func PredictClass(f []float64) int {",
-        "\tp := Predict(f)",
+        "\tp := PredictScores(f)",
         "\tbest := 0",
-        "\tfor i, v := range p {",
-        "\t\tif v > p[best] { best = i }",
-        "\t\t_ = v",
+        "\tfor i := range p {",
+        "\t\tif p[i] > p[best] {",
+        "\t\t\tbest = i",
+        "\t\t}",
         "\t}",
         "\treturn best",
         "}",
@@ -896,7 +905,8 @@ def _write_file(path: str, content: str) -> None:
     outdir = os.path.dirname(path)
     if outdir:
         os.makedirs(outdir, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
+    # LF newlines so output is identical on Windows and Unix (gofmt requires LF)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
         _ = fh.write(content)
 
 
