@@ -57,6 +57,152 @@ def go_f32(x: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fail-fast checks
+# ---------------------------------------------------------------------------
+
+
+def _fail(msg: str) -> None:
+    print(f"Error: {msg}")
+    sys.exit(1)
+
+
+def _warn_objective(library: str, objective: str) -> None:
+    print(
+        f"Warning: {library} objective '{objective}' is not in the known-supported "
+        "list; the exported code returns raw tree sums with no output transform. "
+        "Verify predictions against the original model before deploying."
+    )
+
+
+# Objectives whose output transform the generated code reproduces exactly.
+_LGB_KNOWN = {
+    "regression", "regression_l1", "l1", "l2", "rmse", "mae", "mse", "huber",
+    "fair", "quantile", "mape", "binary", "multiclass", "softmax",
+    "lambdarank", "rank_xendcg",
+}
+# Objectives that need an output transform the generated code does NOT apply.
+_LGB_UNSUPPORTED = {
+    "poisson": "exp() output transform",
+    "gamma": "exp() output transform",
+    "tweedie": "exp() output transform",
+    "cross_entropy": "probability labels / sigmoid output",
+    "xentropy": "probability labels / sigmoid output",
+    "cross_entropy_lambda": "log1p(exp()) output transform",
+    "xentlambda": "log1p(exp()) output transform",
+    "multiclassova": "per-class sigmoid instead of softmax",
+    "ova": "per-class sigmoid instead of softmax",
+}
+
+_XGB_KNOWN = {
+    "reg:squarederror", "reg:squaredlogerror", "reg:absoluteerror",
+    "reg:quantileerror", "reg:pseudohubererror", "reg:logistic",
+    "binary:logistic", "binary:hinge", "multi:softprob", "multi:softmax",
+    "rank:pairwise", "rank:ndcg", "rank:map",
+}
+_XGB_UNSUPPORTED = {
+    "count:poisson": "exp() output transform",
+    "reg:gamma": "exp() output transform",
+    "reg:tweedie": "exp() output transform",
+    "binary:logitraw": "raw-margin output that skips the sigmoid",
+    "survival:cox": "exp() output transform",
+    "survival:aft": "AFT output transform",
+}
+
+_CB_KNOWN = {
+    "rmse", "mae", "quantile", "mape", "huber", "expectile", "logloss",
+    "crossentropy", "multiclass",
+}
+_CB_UNSUPPORTED = {
+    "poisson": "exp() output transform",
+    "tweedie": "exp() output transform",
+    "rmsewithuncertainty": "two-dimensional leaf values",
+}
+
+
+def _check_objective(library: str, objective: str) -> None:
+    key = objective.lower()
+    known = {"LightGBM": _LGB_KNOWN, "XGBoost": _XGB_KNOWN, "CatBoost": _CB_KNOWN}[
+        library
+    ]
+    unsupported = {
+        "LightGBM": _LGB_UNSUPPORTED,
+        "XGBoost": _XGB_UNSUPPORTED,
+        "CatBoost": _CB_UNSUPPORTED,
+    }[library]
+    for name, reason in unsupported.items():
+        if key == name or key.startswith(name + ":"):
+            _fail(
+                f"{library} objective '{objective}' is not supported: "
+                f"it requires {reason}, which the generated code does not "
+                "implement. Predictions would silently differ from Python."
+            )
+    if key not in known:
+        _warn_objective(library, objective)
+
+
+def _check_lgb_tree(node: dict[str, Any]) -> None:
+    if "leaf_value" in node:
+        if "leaf_coeff" in node or "leaf_const" in node:
+            _fail(
+                "LightGBM linear trees (linear_tree=true) are not supported: "
+                "leaves hold linear models, not constants."
+            )
+        return
+    dt = str(node.get("decision_type", "<="))
+    if dt != "<=":
+        _fail(
+            f"LightGBM categorical split on feature {node['split_feature']} "
+            f"(decision_type '{dt}') is not supported. Encode categorical "
+            "features numerically before training, or use one-hot encoding."
+        )
+    _check_lgb_tree(node["left_child"])
+    _check_lgb_tree(node["right_child"])
+
+
+def _check_xgb_model(model_json: dict[str, Any]) -> None:
+    booster_name = str(model_json["learner"]["gradient_booster"].get("name", "gbtree"))
+    if booster_name != "gbtree":
+        _fail(
+            f"XGBoost booster '{booster_name}' is not supported (only gbtree). "
+            + (
+                "DART tree weights are not applied by the generated code."
+                if booster_name == "dart"
+                else ""
+            )
+        )
+    trees = model_json["learner"]["gradient_booster"]["model"]["trees"]
+    for i, t in enumerate(trees):
+        if t.get("categories_nodes") or any(int(s) != 0 for s in t.get("split_type", [])):
+            _fail(
+                f"XGBoost categorical split in tree {i} is not supported. "
+                "Train with numerically encoded features "
+                "(enable_categorical=False)."
+            )
+
+
+def _check_cb_model(cb_json: dict[str, Any]) -> None:
+    if "oblivious_trees" not in cb_json:
+        _fail(
+            "CatBoost model does not use symmetric (oblivious) trees. "
+            "Train with grow_policy='SymmetricTree' (the default)."
+        )
+    if cb_json.get("features_info", {}).get("categorical_features"):
+        _fail(
+            "CatBoost categorical features are not supported: their splits "
+            "use learned CTR statistics that the generated code cannot "
+            "reproduce. Encode categorical features numerically instead."
+        )
+    for i, t in enumerate(cb_json["oblivious_trees"]):
+        for s in t["splits"]:
+            stype = str(s.get("split_type", "FloatFeature"))
+            if stype != "FloatFeature" or "float_feature_index" not in s:
+                _fail(
+                    f"CatBoost split of type '{stype}' in tree {i} is not "
+                    "supported (only plain float-feature splits are)."
+                )
+
+
+# ---------------------------------------------------------------------------
 # LightGBM
 # ---------------------------------------------------------------------------
 
@@ -90,6 +236,12 @@ def export_lgbm(
 
     num_class = int(booster.params.get("num_class", 1))
     objective = booster.params.get("objective", "")
+
+    _check_objective(
+        "LightGBM", (objective or str(dump.get("objective", ""))).split(" ")[0]
+    )
+    for t in trees:
+        _check_lgb_tree(t["tree_structure"])
 
     if num_class > 1:
         mode = "multiclass"
@@ -138,11 +290,14 @@ def export_xgb(model_path: str, output: str, class_name: str, lang: str = "cs") 
     with open(model_path, encoding="utf-8") as f:
         model_json: dict[str, Any] = json.load(f)
 
+    _check_xgb_model(model_json)
+
     lmp: dict[str, Any] = model_json["learner"]["learner_model_param"]
     base_score = float(str(lmp["base_score"]).strip("[]"))
 
     num_class = int(str(lmp.get("num_class", "0")))
     objective = str(model_json["learner"]["objective"]["name"])
+    _check_objective("XGBoost", objective)
 
     if num_class > 1:
         mode = "multiclass"
@@ -242,13 +397,23 @@ def export_cb(model_path: str, output: str, class_name: str, lang: str = "cs") -
     finally:
         os.unlink(tmp_path)
 
+    _check_cb_model(cb_json)
+
     params: dict[str, Any] = cb_json.get("model_info", {}).get("params", {})
     loss: Any = params.get("loss_function", "RMSE")
     if isinstance(loss, dict):
         loss = loss.get("type", "RMSE")
     loss_lower = str(loss).lower()
+    _check_objective("CatBoost", str(loss))
 
     if "multiclass" in loss_lower:
+        # NOTE: superseded by the feat/catboost-multiclass branch, which
+        # implements multiclass support; when merging both, keep that side.
+        _fail(
+            "CatBoost multiclass is not supported: it uses vector-valued "
+            "leaves. Merge the CatBoost-multiclass support branch, or train "
+            "one-vs-rest binary models instead."
+        )
         mode = "multiclass"
         num_class = int(params.get("classes_count", 0))
         if num_class == 0:
