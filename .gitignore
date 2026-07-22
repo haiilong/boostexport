@@ -28,6 +28,9 @@ TestResults/
 *.test
 *.out
 
+# IDE
+.idea/
+
 # Claude Code
 .claude/
 
