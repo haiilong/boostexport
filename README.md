@@ -6,8 +6,10 @@ The generated code uses a data-array evaluator (feature/threshold/left/right arr
 
 Background reading: this project grew out of the blog series
 [Building an ML Inference API](https://haiilong.github.io/blog/building-ml-inference-part-4),
-which walks through the "trees are already if/else" idea and why the
-data-array form beats generated branches.
+which walks through the "trees are already if/else" idea.
+
+You also can read [Revisiting boostexport](https://haiilong.github.io/blog/revisiting-boostexport) to understand the tree representation of data-array form.
+
 
 ---
 
