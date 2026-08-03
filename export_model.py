@@ -25,7 +25,8 @@ import json
 import os
 import sys
 import tempfile
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 
@@ -561,6 +562,8 @@ def _write_cs_node_array(
 
     # LightGBM: extra arrays only needed when some node routes missing values
     lgb_has_missing = any(t != 0 for t in missing_type)
+    max_feature = max(feature, default=0)
+    feature_type = "byte" if max_feature <= 255 else "ushort" if max_feature <= 65535 else "int"
 
     if xgboost:
         thr_decl = (
@@ -600,7 +603,7 @@ def _write_cs_node_array(
 
     lines += [
         "",
-        "    private static readonly int[]    Feature   = ["
+        f"    private static readonly {feature_type}[] Feature   = ["
         + ", ".join(map(str, feature))
         + "];",
         thr_decl,
@@ -694,14 +697,26 @@ def _write_cs_node_array(
         "",
     ]
 
-    lines += _cs_predict_methods(mode, base_score, num_class, has_class_base)
+    lines += _cs_predict_methods(
+        mode,
+        base_score,
+        num_class,
+        has_class_base,
+        unroll_classes=xgboost,
+        unroll_class_blocks=not xgboost,
+    )
     lines.append("}")
 
     _write_file(output, "\n".join(lines) + "\n")
 
 
 def _cs_predict_methods(
-    mode: str, base_score: float, _num_class: int, has_class_base: bool = False
+    mode: str,
+    base_score: float,
+    num_class: int,
+    has_class_base: bool = False,
+    unroll_classes: bool = False,
+    unroll_class_blocks: bool = False,
 ) -> list[str]:
     init = "BaseScore" if base_score != 0.0 else "0"
 
@@ -739,25 +754,72 @@ def _cs_predict_methods(
             "",
             "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
             "    public static int Predict(ReadOnlySpan<double> f)",
-            "        => PredictProbability(f) >= 0.5 ? 1 : 0;",
+            "        => PredictScore(f) >= 0.0 ? 1 : 0;",
         ]
 
-    # multiclass
-    scores_init = (
-        "        double[] s = (double[])ClassBase.Clone();"
-        if has_class_base
-        else "        double[] s = new double[NumClasses];"
-    )
-    return [
-        "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
-        "    public static double[] PredictScores(ReadOnlySpan<double> f)",
-        "    {",
-        scores_init,
-        "        for (int c = 0; c < NumClasses; c++)",
-        "            for (int i = 0; i < TreesPerClass; i++)",
-        "                s[c] += Eval(Roots[c + i * NumClasses], f);",
-        "        return s;",
-        "    }",
+    # Multiclass models usually have a small, fixed class count. Accumulate
+    # those scores in locals so the JIT need not repeatedly index an array.
+    if unroll_classes and num_class <= 8:
+        score_locals = [
+            f"        double s{c} = {'ClassBase[' + str(c) + ']' if has_class_base else '0'};"
+            for c in range(num_class)
+        ]
+        score_additions = [
+            f"            s{c} += Eval(Roots[tree + {c}], f);"
+            for c in range(num_class)
+        ]
+        scores_method = [
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static double[] PredictScores(ReadOnlySpan<double> f)",
+            "    {",
+            *score_locals,
+            "        for (int i = 0; i < TreesPerClass; i++)",
+            "        {",
+            "            int tree = i * NumClasses;",
+            *score_additions,
+            "        }",
+            "        return [" + ", ".join(f"s{c}" for c in range(num_class)) + "];",
+            "    }",
+        ]
+    elif unroll_class_blocks and num_class <= 8:
+        score_locals = [
+            f"        double s{c} = {'ClassBase[' + str(c) + ']' if has_class_base else '0'};"
+            for c in range(num_class)
+        ]
+        score_loops: list[str] = []
+        for c in range(num_class):
+            score_loops += [
+                "        for (int i = 0; i < TreesPerClass; i++)",
+                f"            s{c} += Eval(Roots[{c} + i * NumClasses], f);",
+            ]
+        scores_method = [
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static double[] PredictScores(ReadOnlySpan<double> f)",
+            "    {",
+            *score_locals,
+            *score_loops,
+            "        return [" + ", ".join(f"s{c}" for c in range(num_class)) + "];",
+            "    }",
+        ]
+    else:
+        scores_init = (
+            "        double[] s = (double[])ClassBase.Clone();"
+            if has_class_base
+            else "        double[] s = new double[NumClasses];"
+        )
+        scores_method = [
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static double[] PredictScores(ReadOnlySpan<double> f)",
+            "    {",
+            scores_init,
+            "        for (int c = 0; c < NumClasses; c++)",
+            "            for (int i = 0; i < TreesPerClass; i++)",
+            "                s[c] += Eval(Roots[c + i * NumClasses], f);",
+            "        return s;",
+            "    }",
+        ]
+
+    return scores_method + [
         "",
         "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
         "    public static double[] Predict(ReadOnlySpan<double> f)",
@@ -818,6 +880,11 @@ def _write_cs_catboost(
     # NaN comparing false already matches "AsFalse"/"AsIs"; the extra array is
     # only needed when some feature routes NaN to the true side.
     any_nan_true = any(split_nan_true)
+    uniform_depth = (
+        tree_depth[0]
+        if tree_depth and all(depth == tree_depth[0] for depth in tree_depth)
+        else None
+    )
 
     lines: list[str] = [
         "using System.Runtime.CompilerServices;",
@@ -827,6 +894,9 @@ def _write_cs_catboost(
         f"    private const int    TreeCount = {len(trees)};",
         f"    private const double Scale     = {f64(scale)};",
     ]
+
+    if uniform_depth is not None:
+        lines.append(f"    private const int    TreeDepth = {uniform_depth};")
 
     if mode == "multiclass":
         lines.append(f"    private const int    NumClasses = {num_class};")
@@ -855,24 +925,49 @@ def _write_cs_catboost(
             + "];"
         )
 
+    if uniform_depth is None:
+        lines += [
+            "    private static readonly int[]    TreeSplitOffset = ["
+            + ", ".join(map(str, tree_split_offset))
+            + "];",
+            "    private static readonly int[]    TreeDepth       = ["
+            + ", ".join(map(str, tree_depth))
+            + "];",
+        ]
+
     lines += [
-        "    private static readonly int[]    TreeSplitOffset = ["
-        + ", ".join(map(str, tree_split_offset))
-        + "];",
-        "    private static readonly int[]    TreeDepth       = ["
-        + ", ".join(map(str, tree_depth))
-        + "];",
         "    private static readonly double[] LeafValues      = ["
         + ", ".join(f64(v) for v in leaf_values)
         + "];",
-        "    private static readonly int[]    TreeLeafOffset  = ["
-        + ", ".join(map(str, tree_leaf_offset))
-        + "];",
-        "",
     ]
 
-    # split condition shared by both tree walkers (NaN-aware when needed)
-    if any_nan_true:
+    if uniform_depth is None:
+        lines.append(
+            "    private static readonly int[]    TreeLeafOffset  = ["
+            + ", ".join(map(str, tree_leaf_offset))
+            + "];"
+        )
+
+    lines.append("")
+
+    # Split condition shared by both tree walkers. Fixed-depth models can
+    # unroll their tiny oblivious-tree loop and use constant bit masks.
+    if uniform_depth is not None:
+        split_cond: list[str] = []
+        for level in range(uniform_depth):
+            split_cond.append(f"        int s{level} = splitOffset + {level};")
+            if any_nan_true:
+                split_cond += [
+                    f"        double v{level} = f[SplitFeature[s{level}]];",
+                    f"        if (double.IsNaN(v{level}) ? SplitNanTrue[s{level}] == 1 : v{level} > SplitBorder[s{level}])",
+                    f"            leafIdx |= {1 << level};",
+                ]
+            else:
+                split_cond += [
+                    f"        if (f[SplitFeature[s{level}]] > SplitBorder[s{level}])",
+                    f"            leafIdx |= {1 << level};",
+                ]
+    elif any_nan_true:
         split_cond = [
             "            double v = f[SplitFeature[s]];",
             "            bool bit = double.IsNaN(v) ? SplitNanTrue[s] == 1 : v > SplitBorder[s];",
@@ -885,40 +980,70 @@ def _write_cs_catboost(
             "                leafIdx |= (1 << l);",
         ]
 
+    split_offset = (
+        "treeIdx * TreeDepth"
+        if uniform_depth is not None
+        else "TreeSplitOffset[treeIdx]"
+    )
+    depth = "TreeDepth" if uniform_depth is not None else "TreeDepth[treeIdx]"
+    depth_declaration = (
+        [] if uniform_depth is not None else [f"        int depth = {depth};"]
+    )
+
     if mode == "multiclass":
         # multiclass leaves are vectors: LeafValues[base + c] for class c
+        leaf_base = (
+            "(treeIdx * (1 << TreeDepth) + leafIdx) * NumClasses"
+            if uniform_depth is not None
+            else "TreeLeafOffset[treeIdx] + leafIdx * NumClasses"
+        )
         lines += [
             "    // bit l set when feature[split[l]] > border[split[l]]",
             "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
             "    private static int LeafBase(int treeIdx, ReadOnlySpan<double> f)",
             "    {",
             "        int leafIdx     = 0;",
-            "        int splitOffset = TreeSplitOffset[treeIdx];",
-            "        int depth       = TreeDepth[treeIdx];",
-            "        for (int l = 0; l < depth; l++)",
-            "        {",
-            "            int s = splitOffset + l;",
-        ] + split_cond + [
-            "        }",
-            "        return TreeLeafOffset[treeIdx] + leafIdx * NumClasses;",
+            f"        int splitOffset = {split_offset};",
+        ] + depth_declaration + (
+            split_cond
+            if uniform_depth is not None
+            else [
+                "        for (int l = 0; l < depth; l++)",
+                "        {",
+                "            int s = splitOffset + l;",
+                *split_cond,
+                "        }",
+            ]
+        ) + [
+            f"        return {leaf_base};",
             "    }",
             "",
         ]
     else:
+        leaf_index = (
+            "treeIdx * (1 << TreeDepth) + leafIdx"
+            if uniform_depth is not None
+            else "TreeLeafOffset[treeIdx] + leafIdx"
+        )
         lines += [
             "    // bit l set when feature[split[l]] > border[split[l]]",
             "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
             "    private static double EvalTree(int treeIdx, ReadOnlySpan<double> f)",
             "    {",
             "        int leafIdx     = 0;",
-            "        int splitOffset = TreeSplitOffset[treeIdx];",
-            "        int depth       = TreeDepth[treeIdx];",
-            "        for (int l = 0; l < depth; l++)",
-            "        {",
-            "            int s = splitOffset + l;",
-        ] + split_cond + [
-            "        }",
-            "        return LeafValues[TreeLeafOffset[treeIdx] + leafIdx];",
+            f"        int splitOffset = {split_offset};",
+        ] + depth_declaration + (
+            split_cond
+            if uniform_depth is not None
+            else [
+                "        for (int l = 0; l < depth; l++)",
+                "        {",
+                "            int s = splitOffset + l;",
+                *split_cond,
+                "        }",
+            ]
+        ) + [
+            f"        return LeafValues[{leaf_index}];",
             "    }",
             "",
         ]
@@ -995,7 +1120,7 @@ def _write_cs_catboost(
             "",
             "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
             "    public static int Predict(ReadOnlySpan<double> f)",
-            "        => PredictProbability(f) >= 0.5 ? 1 : 0;",
+            "        => PredictScore(f) >= 0.0 ? 1 : 0;",
         ]
 
     lines.append("}")
