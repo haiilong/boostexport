@@ -2,7 +2,9 @@
 
 Export trained XGBoost, LightGBM, or CatBoost models into self-contained static classes for native inference in C# or Go - no Python runtime, no model files, no extra dependencies at prediction time.
 
-The generated code uses a data-array evaluator (feature/threshold/left/right arrays + a small traversal loop) rather than giant `if/else` trees. It is exact: outputs match the original Python model to within floating-point rounding, including missing-value (NaN) routing.
+The generated code compiles each tree into its own static function (nested ternary expressions in C# and early-return `if` blocks in Go for LightGBM/XGBoost; hardcoded splits with a shared `LeafValues` table for CatBoost) rather than interpreting flat arrays in a loop. Compared to the legacy data-array evaluator, this delivers ~1.8x–2.5x faster steady-state inference on typical models (300 trees) and a ~35% smaller compiled `.dll`, while remaining 100% exact: outputs match the original Python model to within floating-point rounding, including missing-value (NaN) routing.
+
+For very large ensembles (e.g. >1,500–2,000 trees) or cold-start-sensitive processes where JIT compile time matters more than steady-state throughput, pass `--mode array` to emit the original data-array evaluator instead.
 
 Background reading: this project grew out of the blog series
 [Building an ML Inference API](https://haiilong.github.io/blog/building-ml-inference-part-4),
@@ -10,12 +12,11 @@ which walks through the "trees are already if/else" idea.
 
 You also can read [Revisiting boostexport](https://haiilong.github.io/blog/revisiting-boostexport) to understand the tree representation of data-array form.
 
-
 ---
 
 ## How it works
 
-Each boosting model is a sum of decision trees. The exporter reads the trained model, flattens every tree into parallel arrays, and writes a static class with a `Predict` method that walks those arrays at runtime.
+Each boosting model is a sum of decision trees. By default (`--mode compiled`), the exporter compiles every tree into its own private function (`Tree0`, `Tree1`, ...) and sums them in `Predict` (eliminating indirect feature/threshold loads, bounds checks, and shared-PC branch aliasing, while enabling .NET Dynamic PGO hot-path layout). With `--mode array`, it flattens every tree into parallel arrays and walks them with a small evaluator loop.
 
 | Library   | Format  | Tree type              | Comparison                                  |
 |-----------|---------|------------------------|---------------------------------------------|
@@ -95,8 +96,9 @@ python export_model.py
 Prompts for:
 1. Model file path - library inferred from extension (`.json` / `.txt` / `.cbm`), or asked if unknown
 2. Output language - `cs` (default) or `go`
-3. Class/package name - defaults to `Model` (C#) or `model` (Go)
-4. Output file - defaults to `<Name>.cs` or `<Name>.go`
+3. Representation - `compiled` (default) or `array`
+4. Class/package name - defaults to `Model` (C#) or `model` (Go)
+5. Output file - defaults to `<Name>.cs` or `<Name>.go`
 
 ### CLI - C#
 
@@ -104,6 +106,9 @@ Prompts for:
 python export_model.py model_lgb.txt  -c LgbmModel -o LgbmModel.cs
 python export_model.py model_xgb.json -c XgbModel  -o XgbModel.cs
 python export_model.py model_cb.cbm   -c CbModel   -o CbModel.cs
+
+# Optional: emit the data-array evaluator instead of compiled trees
+python export_model.py model_lgb.txt  -c LgbmModel -o LgbmModel.cs --mode array
 ```
 
 ### CLI - Go
@@ -112,6 +117,9 @@ python export_model.py model_cb.cbm   -c CbModel   -o CbModel.cs
 python export_model.py model_lgb.txt  -c lgbm -o lgbm/model.go --lang go
 python export_model.py model_xgb.json -c xgb  -o xgb/model.go  --lang go
 python export_model.py model_cb.cbm   -c cb   -o cb/model.go   --lang go
+
+# Optional: emit the data-array evaluator instead of compiled trees
+python export_model.py model_lgb.txt  -c lgbm -o lgbm/model.go --lang go --mode array
 ```
 
 ### Generated API - C#

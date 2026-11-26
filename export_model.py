@@ -16,12 +16,17 @@ Usage (CLI — Go):
     python export_model.py model_lgb.txt  -c lgbm -o lgbm/model.go --lang go
     python export_model.py model_xgb.json -c xgb  -o xgb/model.go  --lang go
     python export_model.py model_cb.cbm   -c cb   -o cb/model.go   --lang go
+
+Representation modes (--mode):
+    compiled (default) : one compiled function per tree (fastest steady-state inference)
+    array              : flat data arrays + small evaluator loop (instant cold-start / huge ensembles)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -39,22 +44,34 @@ _Node = dict[str, Any]
 
 def f64(x: float) -> str:
     """C# double literal with full precision."""
-    return format(float(x), ".17g") + "d"
+    v = float(x)
+    if math.isinf(v):
+        return "double.PositiveInfinity" if v > 0 else "double.NegativeInfinity"
+    return format(v, ".17g") + "d"
 
 
 def f32_lit(x: float) -> str:
     """C# float literal at float32 precision."""
-    return format(float(np.float32(x)), ".9g") + "f"
+    v = float(np.float32(x))
+    if math.isinf(v):
+        return "float.PositiveInfinity" if v > 0 else "float.NegativeInfinity"
+    return format(v, ".9g") + "f"
 
 
 def go_f64(x: float) -> str:
     """Go float64 literal with full precision."""
-    return format(float(x), ".17g")
+    v = float(x)
+    if math.isinf(v):
+        return "math.Inf(1)" if v > 0 else "math.Inf(-1)"
+    return format(v, ".17g")
 
 
 def go_f32(x: float) -> str:
     """Go float32 literal (exact float32 value, no suffix - typed by context)."""
-    return format(float(np.float32(x)), ".9g")
+    v = float(np.float32(x))
+    if math.isinf(v):
+        return "float32(math.Inf(1))" if v > 0 else "float32(math.Inf(-1))"
+    return format(v, ".9g")
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +253,11 @@ def _flatten_lgb(node: dict[str, Any], nodes: list[_Node]) -> int:
 
 
 def export_lgbm(
-    model_path: str, output: str, class_name: str, lang: str = "cs"
+    model_path: str,
+    output: str,
+    class_name: str,
+    lang: str = "cs",
+    emit_mode: str = "compiled",
 ) -> None:
     import lightgbm as lgb
 
@@ -265,30 +286,25 @@ def export_lgbm(
     for t in trees:
         roots.append(_flatten_lgb(t["tree_structure"], nodes))
 
-    if lang == "go":
-        _write_go_node_array(
-            nodes,
-            roots,
-            class_name,
-            output,
-            base_score=0.0,
-            xgboost=False,
-            mode=mode,
-            num_class=num_class,
-        )
+    if emit_mode == "compiled":
+        writer = _write_go_compiled_trees if lang == "go" else _write_cs_compiled_trees
     else:
-        _write_cs_node_array(
-            nodes,
-            roots,
-            class_name,
-            output,
-            base_score=0.0,
-            xgboost=False,
-            mode=mode,
-            num_class=num_class,
-        )
+        writer = _write_go_node_array if lang == "go" else _write_cs_node_array
 
-    _print_summary("LightGBM", mode, lang, len(trees), len(nodes), output)
+    writer(
+        nodes,
+        roots,
+        class_name,
+        output,
+        base_score=0.0,
+        xgboost=False,
+        mode=mode,
+        num_class=num_class,
+    )
+
+    _print_summary(
+        "LightGBM", mode, lang, len(trees), len(nodes), output, emit_mode=emit_mode
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -296,9 +312,13 @@ def export_lgbm(
 # ---------------------------------------------------------------------------
 
 
-def export_xgb(model_path: str, output: str, class_name: str, lang: str = "cs") -> None:
-    import math
-
+def export_xgb(
+    model_path: str,
+    output: str,
+    class_name: str,
+    lang: str = "cs",
+    emit_mode: str = "compiled",
+) -> None:
     with open(model_path, encoding="utf-8") as f:
         model_json: dict[str, Any] = json.load(f)
 
@@ -350,30 +370,22 @@ def export_xgb(model_path: str, output: str, class_name: str, lang: str = "cs") 
     for t in raw_trees:
         roots.append(_flatten_xgb_flat(t, nodes))
 
-    if lang == "go":
-        _write_go_node_array(
-            nodes,
-            roots,
-            class_name,
-            output,
-            base_score=effective_base,
-            xgboost=True,
-            mode=mode,
-            num_class=num_class,
-            class_base=class_base,
-        )
+    if emit_mode == "compiled":
+        writer = _write_go_compiled_trees if lang == "go" else _write_cs_compiled_trees
     else:
-        _write_cs_node_array(
-            nodes,
-            roots,
-            class_name,
-            output,
-            base_score=effective_base,
-            xgboost=True,
-            mode=mode,
-            num_class=num_class,
-            class_base=class_base,
-        )
+        writer = _write_go_node_array if lang == "go" else _write_cs_node_array
+
+    writer(
+        nodes,
+        roots,
+        class_name,
+        output,
+        base_score=effective_base,
+        xgboost=True,
+        mode=mode,
+        num_class=num_class,
+        class_base=class_base,
+    )
 
     _print_summary(
         "XGBoost",
@@ -383,6 +395,7 @@ def export_xgb(model_path: str, output: str, class_name: str, lang: str = "cs") 
         len(nodes),
         output,
         extra=f"base_score={lmp['base_score']}",
+        emit_mode=emit_mode,
     )
 
 
@@ -421,7 +434,13 @@ def _flatten_xgb_flat(tree: dict[str, Any], nodes: list[_Node]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def export_cb(model_path: str, output: str, class_name: str, lang: str = "cs") -> None:
+def export_cb(
+    model_path: str,
+    output: str,
+    class_name: str,
+    lang: str = "cs",
+    emit_mode: str = "compiled",
+) -> None:
     import catboost as cb
 
     model = cb.CatBoost()
@@ -487,16 +506,25 @@ def export_cb(model_path: str, output: str, class_name: str, lang: str = "cs") -
         idx = int(ff.get("feature_index", ff.get("flat_feature_index", 0)))
         nan_true_by_feature[idx] = ff.get("nan_value_treatment") == "AsTrue"
 
-    if lang == "go":
-        _write_go_catboost(
-            trees, scale, biases, class_name, output, mode=mode,
-            num_class=num_class, nan_true_by_feature=nan_true_by_feature,
+    if emit_mode == "compiled":
+        writer = (
+            _write_go_compiled_catboost
+            if lang == "go"
+            else _write_cs_compiled_catboost
         )
     else:
-        _write_cs_catboost(
-            trees, scale, biases, class_name, output, mode=mode,
-            num_class=num_class, nan_true_by_feature=nan_true_by_feature,
-        )
+        writer = _write_go_catboost if lang == "go" else _write_cs_catboost
+
+    writer(
+        trees,
+        scale,
+        biases,
+        class_name,
+        output,
+        mode=mode,
+        num_class=num_class,
+        nan_true_by_feature=nan_true_by_feature,
+    )
 
     _print_summary(
         "CatBoost",
@@ -506,16 +534,406 @@ def export_cb(model_path: str, output: str, class_name: str, lang: str = "cs") -
         0,
         output,
         extra=f"scale={scale}  bias={biases if mode == 'multiclass' else biases[0]}",
+        emit_mode=emit_mode,
     )
 
 
 # ---------------------------------------------------------------------------
 # C# writers
 #
-# Leaf nodes: Left[i] == -1 (sentinel; no IsLeaf array needed)
-# XGBoost: threshold is float[] + cast (float) to match DMatrix float32
-# `using System` omitted - .NET 6+ implicit global usings cover System.Math
+# Compiled mode (default): one private static method per tree (nested ternary
+#   for asymmetric trees; hardcoded splits + shared LeafValues for CatBoost).
+#   Missing-value (NaN) routing uses IEEE-754 negated comparisons so NaN takes
+#   the exact trained default side with zero IsNaN checks and zero copies.
+# Array mode (--mode array): flat data arrays + small traversal loop.
+# `using System` omitted - .NET 6+ implicit global usings cover System.Math.
 # ---------------------------------------------------------------------------
+
+
+def _cs_split_cond(node: _Node, xgboost: bool) -> str:
+    """Return a C# boolean expression that is true iff the split goes LEFT."""
+    feat = node["feature"]
+    thr = float(node["threshold"])
+
+    if xgboost:
+        thr_lit = f32_lit(thr)
+        if node["missing_left"]:
+            return f"!((float)f[{feat}] >= {thr_lit})"
+        return f"(float)f[{feat}] < {thr_lit}"
+
+    miss = int(node["missing"])
+    default_left = bool(node["default_left"])
+    thr_lit = f64(thr)
+
+    if miss == 0:
+        # LightGBM missing_type None: NaN is treated as 0.0
+        return f"!(f[{feat}] > {thr_lit})" if thr >= 0.0 else f"f[{feat}] <= {thr_lit}"
+
+    if miss == 2:
+        # LightGBM missing_type NaN: NaN follows default_left
+        return f"!(f[{feat}] > {thr_lit})" if default_left else f"f[{feat}] <= {thr_lit}"
+
+    # LightGBM missing_type Zero: NaN and |v| <= 1e-35 follow default_left
+    if default_left:
+        if thr >= 1e-35:
+            return f"!(f[{feat}] > {thr_lit})"
+        if thr >= -1e-35:
+            return f"!(f[{feat}] > 1e-35d)"
+        return f"(!(f[{feat}] > {thr_lit}) || (f[{feat}] >= -1e-35d && f[{feat}] <= 1e-35d))"
+
+    if thr < -1e-35:
+        return f"f[{feat}] <= {thr_lit}"
+    if thr <= 1e-35:
+        return f"f[{feat}] < -1e-35d"
+    return f"(f[{feat}] <= {thr_lit} && (f[{feat}] < -1e-35d || f[{feat}] > 1e-35d))"
+
+
+def _emit_cs_tree_expr(nodes: list[_Node], idx: int, xgboost: bool) -> str:
+    n = nodes[idx]
+    if n["leaf"]:
+        return f64(n["value"])
+    cond = _cs_split_cond(n, xgboost)
+    left_expr = _emit_cs_tree_expr(nodes, n["left"], xgboost)
+    right_expr = _emit_cs_tree_expr(nodes, n["right"], xgboost)
+    return f"({cond} ? {left_expr} : {right_expr})"
+
+
+def _write_cs_compiled_trees(
+    nodes: list[_Node],
+    roots: list[int],
+    class_name: str,
+    output: str,
+    base_score: float = 0.0,
+    xgboost: bool = False,
+    mode: str = "regression",
+    num_class: int = 1,
+    class_base: list[float] | None = None,
+) -> None:
+    has_class_base = class_base is not None and any(v != 0.0 for v in class_base)
+    n_trees = len(roots)
+    needs_inlining = mode in ("binary", "multiclass")
+
+    lines: list[str] = []
+    if needs_inlining:
+        lines += ["using System.Runtime.CompilerServices;", ""]
+    lines += [f"public static class {class_name}", "{"]
+
+    if mode == "multiclass" and num_class > 8:
+        lines.append(f"    private const int NumClasses = {num_class};")
+        if has_class_base:
+            assert class_base is not None
+            lines.append(
+                "    private static readonly double[] ClassBase = ["
+                + ", ".join(f64(v) for v in class_base)
+                + "];"
+            )
+        lines.append("")
+    elif base_score != 0.0 and mode != "multiclass":
+        lines.append(f"    private const double BaseScore = {f64(base_score)};")
+        lines.append("")
+
+    init = "BaseScore" if base_score != 0.0 else "0"
+
+    if mode == "regression":
+        lines += [
+            "    public static double Predict(ReadOnlySpan<double> f)",
+            "    {",
+            f"        double s = {init};",
+            *[f"        s += Tree{i}(f);" for i in range(n_trees)],
+            "        return s;",
+            "    }",
+        ]
+    elif mode == "binary":
+        lines += [
+            "    public static double PredictScore(ReadOnlySpan<double> f)",
+            "    {",
+            f"        double s = {init};",
+            *[f"        s += Tree{i}(f);" for i in range(n_trees)],
+            "        return s;",
+            "    }",
+            "",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static double PredictProbability(ReadOnlySpan<double> f)",
+            "    {",
+            "        double x = PredictScore(f);",
+            "        return x >= 0",
+            "            ? 1.0 / (1.0 + Math.Exp(-x))",
+            "            : Math.Exp(x) / (1.0 + Math.Exp(x));",
+            "    }",
+            "",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static int Predict(ReadOnlySpan<double> f)",
+            "        => PredictScore(f) >= 0.0 ? 1 : 0;",
+        ]
+    else:
+        trees_per_class = n_trees // num_class
+        if num_class <= 8:
+            score_locals = [
+                f"        double s{c} = {f64(class_base[c]) if has_class_base and class_base is not None else '0'};"
+                for c in range(num_class)
+            ]
+            score_calls: list[str] = []
+            for c in range(num_class):
+                for r in range(trees_per_class):
+                    score_calls.append(f"        s{c} += Tree{c + r * num_class}(f);")
+            lines += [
+                "    public static double[] PredictScores(ReadOnlySpan<double> f)",
+                "    {",
+                *score_locals,
+                *score_calls,
+                "        return [" + ", ".join(f"s{c}" for c in range(num_class)) + "];",
+                "    }",
+            ]
+        else:
+            scores_init = (
+                "        double[] s = (double[])ClassBase.Clone();"
+                if has_class_base
+                else "        double[] s = new double[NumClasses];"
+            )
+            score_calls = []
+            for c in range(num_class):
+                for r in range(trees_per_class):
+                    score_calls.append(f"        s[{c}] += Tree{c + r * num_class}(f);")
+            lines += [
+                "    public static double[] PredictScores(ReadOnlySpan<double> f)",
+                "    {",
+                scores_init,
+                *score_calls,
+                "        return s;",
+                "    }",
+            ]
+
+        lines += [
+            "",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static double[] Predict(ReadOnlySpan<double> f)",
+            "    {",
+            "        double[] s = PredictScores(f);",
+            "        double max = s[0];",
+            "        for (int i = 1; i < s.Length; i++) if (s[i] > max) max = s[i];",
+            "        double sum = 0;",
+            "        for (int i = 0; i < s.Length; i++) { s[i] = Math.Exp(s[i] - max); sum += s[i]; }",
+            "        for (int i = 0; i < s.Length; i++) s[i] /= sum;",
+            "        return s;",
+            "    }",
+            "",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static int PredictClass(ReadOnlySpan<double> f)",
+            "    {",
+            "        double[] p = PredictScores(f);",
+            "        int best = 0;",
+            "        for (int i = 1; i < p.Length; i++) if (p[i] > p[best]) best = i;",
+            "        return best;",
+            "    }",
+        ]
+
+    lines.append("")
+    for i, root in enumerate(roots):
+        expr = _emit_cs_tree_expr(nodes, root, xgboost)
+        lines.append(f"    private static double Tree{i}(ReadOnlySpan<double> f) => {expr};")
+
+    lines.append("}")
+    _write_file(output, "\n".join(lines) + "\n")
+
+
+def _write_cs_compiled_catboost(
+    trees: list[Any],
+    scale: float,
+    biases: list[float],
+    class_name: str,
+    output: str,
+    mode: str = "regression",
+    num_class: int = 1,
+    nan_true_by_feature: dict[int, bool] | None = None,
+) -> None:
+    nan_true_by_feature = nan_true_by_feature or {}
+    leaf_values: list[float] = []
+    tree_leaf_offset: list[int] = []
+
+    for t in trees:
+        tree_leaf_offset.append(len(leaf_values))
+        if mode == "multiclass" or len(t["splits"]) > 0:
+            for v in t["leaf_values"]:
+                leaf_values.append(float(v))
+
+    needs_inlining = mode in ("binary", "multiclass")
+    lines: list[str] = []
+    if needs_inlining:
+        lines += ["using System.Runtime.CompilerServices;", ""]
+    lines += [
+        f"public static class {class_name}",
+        "{",
+        f"    private const double Scale = {f64(scale)};",
+    ]
+
+    if mode == "multiclass":
+        lines.append(f"    private const int NumClasses = {num_class};")
+        lines.append(
+            "    private static readonly double[] Bias = ["
+            + ", ".join(f64(b) for b in biases)
+            + "];"
+        )
+    else:
+        lines.append(f"    private const double Bias = {f64(biases[0])};")
+
+    if leaf_values:
+        lines.append("")
+        lines.append(
+            "    private static readonly double[] LeafValues = ["
+            + ", ".join(f64(v) for v in leaf_values)
+            + "];"
+        )
+
+    lines.append("")
+
+    if mode == "multiclass":
+        if num_class <= 8:
+            score_locals = [f"        double s{c} = 0;" for c in range(num_class)]
+            calls: list[str] = ["        int b;"] if trees else []
+            for ti in range(len(trees)):
+                adds = " ".join(
+                    f"s{c} += LeafValues[b{f' + {c}' if c > 0 else ''}];"
+                    for c in range(num_class)
+                )
+                calls.append(f"        b = LeafBase{ti}(f); {adds}")
+            ret = (
+                "        return ["
+                + ", ".join(f"Bias[{c}] + Scale * s{c}" for c in range(num_class))
+                + "];"
+            )
+            lines += [
+                "    public static double[] PredictScores(ReadOnlySpan<double> f)",
+                "    {",
+                *score_locals,
+                *calls,
+                ret,
+                "    }",
+            ]
+        else:
+            calls = ["        int b;"] if trees else []
+            for ti in range(len(trees)):
+                calls.append(
+                    f"        b = LeafBase{ti}(f); for (int c = 0; c < NumClasses; c++) s[c] += LeafValues[b + c];"
+                )
+            lines += [
+                "    public static double[] PredictScores(ReadOnlySpan<double> f)",
+                "    {",
+                "        double[] s = new double[NumClasses];",
+                *calls,
+                "        for (int c = 0; c < NumClasses; c++)",
+                "            s[c] = Bias[c] + Scale * s[c];",
+                "        return s;",
+                "    }",
+            ]
+
+        lines += [
+            "",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static double[] Predict(ReadOnlySpan<double> f)",
+            "    {",
+            "        double[] s = PredictScores(f);",
+            "        double max = s[0];",
+            "        for (int i = 1; i < s.Length; i++) if (s[i] > max) max = s[i];",
+            "        double sum = 0;",
+            "        for (int i = 0; i < s.Length; i++) { s[i] = Math.Exp(s[i] - max); sum += s[i]; }",
+            "        for (int i = 0; i < s.Length; i++) s[i] /= sum;",
+            "        return s;",
+            "    }",
+            "",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static int PredictClass(ReadOnlySpan<double> f)",
+            "    {",
+            "        double[] p = PredictScores(f);",
+            "        int best = 0;",
+            "        for (int i = 1; i < p.Length; i++) if (p[i] > p[best]) best = i;",
+            "        return best;",
+            "    }",
+        ]
+    elif mode == "regression":
+        lines += [
+            "    public static double Predict(ReadOnlySpan<double> f)",
+            "    {",
+            "        double s = 0;",
+            *[f"        s += Tree{ti}(f);" for ti in range(len(trees))],
+            "        return Bias + Scale * s;",
+            "    }",
+        ]
+    else:
+        lines += [
+            "    public static double PredictScore(ReadOnlySpan<double> f)",
+            "    {",
+            "        double s = 0;",
+            *[f"        s += Tree{ti}(f);" for ti in range(len(trees))],
+            "        return Bias + Scale * s;",
+            "    }",
+            "",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static double PredictProbability(ReadOnlySpan<double> f)",
+            "    {",
+            "        double x = PredictScore(f);",
+            "        return x >= 0",
+            "            ? 1.0 / (1.0 + Math.Exp(-x))",
+            "            : Math.Exp(x) / (1.0 + Math.Exp(x));",
+            "    }",
+            "",
+            "    [MethodImpl(MethodImplOptions.AggressiveInlining)]",
+            "    public static int Predict(ReadOnlySpan<double> f)",
+            "        => PredictScore(f) >= 0.0 ? 1 : 0;",
+        ]
+
+    lines.append("")
+    for ti, t in enumerate(trees):
+        splits = t["splits"]
+        offset = tree_leaf_offset[ti]
+        if mode == "multiclass":
+            if not splits:
+                lines.append(
+                    f"    private static int LeafBase{ti}(ReadOnlySpan<double> f) => {offset};"
+                )
+            else:
+                lines += [
+                    f"    private static int LeafBase{ti}(ReadOnlySpan<double> f)",
+                    "    {",
+                    "        int i = 0;",
+                ]
+                for level, s in enumerate(splits):
+                    fidx = int(s["float_feature_index"])
+                    border = f64(float(s["border"]))
+                    cond = (
+                        f"!(f[{fidx}] <= {border})"
+                        if nan_true_by_feature.get(fidx)
+                        else f"f[{fidx}] > {border}"
+                    )
+                    lines.append(f"        if ({cond}) i |= {1 << level};")
+                ret_expr = (
+                    f"{offset} + i * NumClasses" if offset > 0 else "i * NumClasses"
+                )
+                lines += [f"        return {ret_expr};", "    }"]
+        else:
+            if not splits:
+                lines.append(
+                    f"    private static double Tree{ti}(ReadOnlySpan<double> f) => {f64(float(t['leaf_values'][0]))};"
+                )
+            else:
+                lines += [
+                    f"    private static double Tree{ti}(ReadOnlySpan<double> f)",
+                    "    {",
+                    "        int i = 0;",
+                ]
+                for level, s in enumerate(splits):
+                    fidx = int(s["float_feature_index"])
+                    border = f64(float(s["border"]))
+                    cond = (
+                        f"!(f[{fidx}] <= {border})"
+                        if nan_true_by_feature.get(fidx)
+                        else f"f[{fidx}] > {border}"
+                    )
+                    lines.append(f"        if ({cond}) i |= {1 << level};")
+                idx_expr = f"{offset} + i" if offset > 0 else "i"
+                lines += [f"        return LeafValues[{idx_expr}];", "    }"]
+
+    lines.append("}")
+    _write_file(output, "\n".join(lines) + "\n")
 
 
 def _write_cs_node_array(
@@ -1130,10 +1548,471 @@ def _write_cs_catboost(
 # ---------------------------------------------------------------------------
 # Go writers
 #
-# Leaf nodes: left[i] == -1 (sentinel; same logic as C# version)
-# XGBoost: threshold is []float32; cast feature to float32 before comparing
-# Package name = class_name lowercased
+# Compiled mode (default): one function per tree (early-return nested if for
+#   asymmetric trees; hardcoded splits + shared leafValues for CatBoost).
+#   Missing-value (NaN) routing uses IEEE-754 negated comparisons so NaN takes
+#   the exact trained default side with zero math.IsNaN calls.
+# Array mode (--mode array): flat slices + small traversal loop.
+# Package name = class_name lowercased. Output is strictly gofmt-clean.
 # ---------------------------------------------------------------------------
+
+
+def _go_split_cond(node: _Node, xgboost: bool) -> str:
+    """Return a Go `if` condition (or `init; cond`) that is true iff the split goes LEFT."""
+    feat = node["feature"]
+    thr = float(node["threshold"])
+
+    if xgboost:
+        thr_lit = go_f32(thr)
+        if node["missing_left"]:
+            return f"!(float32(f[{feat}]) >= {thr_lit})"
+        return f"float32(f[{feat}]) < {thr_lit}"
+
+    miss = int(node["missing"])
+    default_left = bool(node["default_left"])
+    thr_lit = go_f64(thr)
+
+    if miss == 0:
+        # LightGBM missing_type None: NaN is treated as 0.0
+        return f"!(f[{feat}] > {thr_lit})" if thr >= 0.0 else f"f[{feat}] <= {thr_lit}"
+
+    if miss == 2:
+        # LightGBM missing_type NaN: NaN follows default_left
+        return f"!(f[{feat}] > {thr_lit})" if default_left else f"f[{feat}] <= {thr_lit}"
+
+    # LightGBM missing_type Zero: NaN and |v| <= 1e-35 follow default_left
+    if default_left:
+        if thr >= 1e-35:
+            return f"!(f[{feat}] > {thr_lit})"
+        if thr >= -1e-35:
+            return f"!(f[{feat}] > 1e-35)"
+        return f"v := f[{feat}]; !(v > {thr_lit}) || (v >= -1e-35 && v <= 1e-35)"
+
+    if thr < -1e-35:
+        return f"f[{feat}] <= {thr_lit}"
+    if thr <= 1e-35:
+        return f"f[{feat}] < -1e-35"
+    return f"v := f[{feat}]; v <= {thr_lit} && (v < -1e-35 || v > 1e-35)"
+
+
+def _emit_go_tree_body(
+    nodes: list[_Node], idx: int, xgboost: bool, indent: int
+) -> list[str]:
+    pad = "\t" * indent
+    n = nodes[idx]
+    if n["leaf"]:
+        return [f"{pad}return {go_f64(n['value'])}"]
+    cond = _go_split_cond(n, xgboost)
+    out = [f"{pad}if {cond} {{"]
+    out += _emit_go_tree_body(nodes, n["left"], xgboost, indent + 1)
+    out.append(f"{pad}}}")
+    out += _emit_go_tree_body(nodes, n["right"], xgboost, indent)
+    return out
+
+
+def _write_go_compiled_trees(
+    nodes: list[_Node],
+    roots: list[int],
+    class_name: str,
+    output: str,
+    base_score: float = 0.0,
+    xgboost: bool = False,
+    mode: str = "regression",
+    num_class: int = 1,
+    class_base: list[float] | None = None,
+) -> None:
+    pkg = class_name.lower()
+    has_class_base = class_base is not None and any(v != 0.0 for v in class_base)
+    n_trees = len(roots)
+
+    tree_funcs: list[str] = []
+    for i, root in enumerate(roots):
+        tree_funcs.append(f"func tree{i}(f []float64) float64 {{")
+        tree_funcs += _emit_go_tree_body(nodes, root, xgboost, 1)
+        tree_funcs.append("}")
+        tree_funcs.append("")
+
+    body_lines: list[str] = []
+    const_lines: list[str] = []
+    var_lines: list[str] = []
+
+    if mode == "multiclass" and num_class > 8:
+        const_lines.append(f"\tnumClasses = {num_class}")
+        if has_class_base:
+            assert class_base is not None
+            var_lines.append(
+                "\tclassBase = []float64{"
+                + ", ".join(go_f64(v) for v in class_base)
+                + "}"
+            )
+    elif base_score != 0.0 and mode != "multiclass":
+        const_lines.append(f"\tbaseScore = {go_f64(base_score)}")
+
+    if const_lines:
+        body_lines += ["const ("] + const_lines + [")", ""]
+    if var_lines:
+        body_lines += ["//nolint:gochecknoglobals", "var ("] + var_lines + [")", ""]
+
+    init = "baseScore" if base_score != 0.0 else "0.0"
+
+    if mode == "regression":
+        body_lines += [
+            "// Predict returns the regression score for feature vector f.",
+            "func Predict(f []float64) float64 {",
+            f"\ts := {init}",
+            *[f"\ts += tree{i}(f)" for i in range(n_trees)],
+            "\treturn s",
+            "}",
+            "",
+        ]
+    elif mode == "binary":
+        body_lines += [
+            "// PredictScore returns the raw logit for feature vector f.",
+            "func PredictScore(f []float64) float64 {",
+            f"\ts := {init}",
+            *[f"\ts += tree{i}(f)" for i in range(n_trees)],
+            "\treturn s",
+            "}",
+            "",
+            "// PredictProbability returns sigmoid(PredictScore(f)).",
+            "func PredictProbability(f []float64) float64 {",
+            "\tx := PredictScore(f)",
+            "\tif x >= 0 {",
+            "\t\treturn 1.0 / (1.0 + math.Exp(-x))",
+            "\t}",
+            "\treturn math.Exp(x) / (1.0 + math.Exp(x))",
+            "}",
+            "",
+            "// Predict returns 0 or 1 (threshold 0.5).",
+            "func Predict(f []float64) int {",
+            "\tif PredictScore(f) >= 0 {",
+            "\t\treturn 1",
+            "\t}",
+            "\treturn 0",
+            "}",
+            "",
+        ]
+    else:
+        trees_per_class = n_trees // num_class
+        if num_class <= 8:
+            score_locals = [
+                f"\ts{c} := {go_f64(class_base[c]) if has_class_base and class_base is not None else '0.0'}"
+                for c in range(num_class)
+            ]
+            score_calls: list[str] = []
+            for c in range(num_class):
+                for r in range(trees_per_class):
+                    score_calls.append(f"\ts{c} += tree{c + r * num_class}(f)")
+            body_lines += [
+                "// PredictScores returns raw per-class scores.",
+                "func PredictScores(f []float64) []float64 {",
+                *score_locals,
+                *score_calls,
+                "\treturn []float64{" + ", ".join(f"s{c}" for c in range(num_class)) + "}",
+                "}",
+            ]
+        else:
+            scores_init = ["\ts := make([]float64, numClasses)"]
+            if has_class_base:
+                scores_init.append("\tcopy(s, classBase)")
+            score_calls = []
+            for c in range(num_class):
+                for r in range(trees_per_class):
+                    score_calls.append(f"\ts[{c}] += tree{c + r * num_class}(f)")
+            body_lines += [
+                "// PredictScores returns raw per-class scores.",
+                "func PredictScores(f []float64) []float64 {",
+                *scores_init,
+                *score_calls,
+                "\treturn s",
+                "}",
+            ]
+
+        body_lines += [
+            "",
+            "// Predict returns softmax probabilities over all classes.",
+            "func Predict(f []float64) []float64 {",
+            "\ts := PredictScores(f)",
+            "\tmax := s[0]",
+            "\tfor _, v := range s {",
+            "\t\tif v > max {",
+            "\t\t\tmax = v",
+            "\t\t}",
+            "\t}",
+            "\tsum := 0.0",
+            "\tfor i := range s {",
+            "\t\ts[i] = math.Exp(s[i] - max)",
+            "\t\tsum += s[i]",
+            "\t}",
+            "\tfor i := range s {",
+            "\t\ts[i] /= sum",
+            "\t}",
+            "\treturn s",
+            "}",
+            "",
+            "// PredictClass returns the class index with the highest probability.",
+            "func PredictClass(f []float64) int {",
+            "\tp := PredictScores(f)",
+            "\tbest := 0",
+            "\tfor i := range p {",
+            "\t\tif p[i] > p[best] {",
+            "\t\t\tbest = i",
+            "\t\t}",
+            "\t}",
+            "\treturn best",
+            "}",
+            "",
+        ]
+
+    # Trim trailing blank line from tree_funcs so file ends with single newline
+    if tree_funcs and tree_funcs[-1] == "":
+        tree_funcs.pop()
+
+    full_body = body_lines + tree_funcs
+    needs_math = mode in ("binary", "multiclass") or any(
+        "math." in line for line in full_body
+    )
+
+    header: list[str] = [f"package {pkg}", ""]
+    if needs_math:
+        header += ['import "math"', ""]
+
+    _write_file(output, "\n".join(header + full_body) + "\n")
+
+
+def _write_go_compiled_catboost(
+    trees: list[Any],
+    scale: float,
+    biases: list[float],
+    class_name: str,
+    output: str,
+    mode: str = "regression",
+    num_class: int = 1,
+    nan_true_by_feature: dict[int, bool] | None = None,
+) -> None:
+    pkg = class_name.lower()
+    nan_true_by_feature = nan_true_by_feature or {}
+
+    leaf_values: list[float] = []
+    tree_leaf_offset: list[int] = []
+    for t in trees:
+        tree_leaf_offset.append(len(leaf_values))
+        if mode == "multiclass" or len(t["splits"]) > 0:
+            for v in t["leaf_values"]:
+                leaf_values.append(float(v))
+
+    body_lines: list[str] = []
+
+    if mode == "multiclass":
+        const_lines = [
+            f"\tscale      = {go_f64(scale)}",
+            f"\tnumClasses = {num_class}",
+        ]
+        var_lines = [
+            "\tbias       = []float64{" + ", ".join(go_f64(b) for b in biases) + "}",
+            "\tleafValues = []float64{"
+            + ", ".join(go_f64(v) for v in leaf_values)
+            + "}",
+        ]
+    else:
+        const_lines = [
+            f"\tscale = {go_f64(scale)}",
+            f"\tbias  = {go_f64(biases[0])}",
+        ]
+        var_lines = (
+            [
+                "\tleafValues = []float64{"
+                + ", ".join(go_f64(v) for v in leaf_values)
+                + "}"
+            ]
+            if leaf_values
+            else []
+        )
+
+    body_lines += ["const ("] + const_lines + [")", ""]
+    if var_lines:
+        body_lines += ["//nolint:gochecknoglobals", "var ("] + var_lines + [")", ""]
+
+    if mode == "multiclass":
+        if num_class <= 8:
+            score_locals = [f"\ts{c} := 0.0" for c in range(num_class)]
+            calls: list[str] = ["\tvar b int"] if trees else []
+            for ti in range(len(trees)):
+                calls.append(f"\tb = leafBase{ti}(f)")
+                for c in range(num_class):
+                    idx_str = "b" if c == 0 else f"b+{c}"
+                    calls.append(f"\ts{c} += leafValues[{idx_str}]")
+            ret = (
+                "\treturn []float64{"
+                + ", ".join(f"bias[{c}] + scale*s{c}" for c in range(num_class))
+                + "}"
+            )
+            body_lines += [
+                "// PredictScores returns raw per-class scores (RawFormulaVal).",
+                "func PredictScores(f []float64) []float64 {",
+                *score_locals,
+                *calls,
+                ret,
+                "}",
+            ]
+        else:
+            calls = ["\tvar b int"] if trees else []
+            for ti in range(len(trees)):
+                calls += [
+                    f"\tb = leafBase{ti}(f)",
+                    "\tfor c := 0; c < numClasses; c++ {",
+                    "\t\ts[c] += leafValues[b+c]",
+                    "\t}",
+                ]
+            body_lines += [
+                "// PredictScores returns raw per-class scores (RawFormulaVal).",
+                "func PredictScores(f []float64) []float64 {",
+                "\ts := make([]float64, numClasses)",
+                *calls,
+                "\tfor c := 0; c < numClasses; c++ {",
+                "\t\ts[c] = bias[c] + scale*s[c]",
+                "\t}",
+                "\treturn s",
+                "}",
+            ]
+
+        body_lines += [
+            "",
+            "// Predict returns softmax probabilities over all classes.",
+            "func Predict(f []float64) []float64 {",
+            "\ts := PredictScores(f)",
+            "\tmax := s[0]",
+            "\tfor _, v := range s {",
+            "\t\tif v > max {",
+            "\t\t\tmax = v",
+            "\t\t}",
+            "\t}",
+            "\tsum := 0.0",
+            "\tfor i := range s {",
+            "\t\ts[i] = math.Exp(s[i] - max)",
+            "\t\tsum += s[i]",
+            "\t}",
+            "\tfor i := range s {",
+            "\t\ts[i] /= sum",
+            "\t}",
+            "\treturn s",
+            "}",
+            "",
+            "// PredictClass returns the class index with the highest score.",
+            "func PredictClass(f []float64) int {",
+            "\tp := PredictScores(f)",
+            "\tbest := 0",
+            "\tfor i := range p {",
+            "\t\tif p[i] > p[best] {",
+            "\t\t\tbest = i",
+            "\t\t}",
+            "\t}",
+            "\treturn best",
+            "}",
+            "",
+        ]
+    elif mode == "regression":
+        body_lines += [
+            "// Predict returns the regression score for feature vector f.",
+            "func Predict(f []float64) float64 {",
+            "\ts := 0.0",
+            *[f"\ts += tree{ti}(f)" for ti in range(len(trees))],
+            "\treturn bias + scale*s",
+            "}",
+            "",
+        ]
+    else:
+        body_lines += [
+            "// PredictScore returns the raw logit for feature vector f.",
+            "func PredictScore(f []float64) float64 {",
+            "\ts := 0.0",
+            *[f"\ts += tree{ti}(f)" for ti in range(len(trees))],
+            "\treturn bias + scale*s",
+            "}",
+            "",
+            "// PredictProbability returns sigmoid(PredictScore(f)).",
+            "func PredictProbability(f []float64) float64 {",
+            "\tx := PredictScore(f)",
+            "\tif x >= 0 {",
+            "\t\treturn 1.0 / (1.0 + math.Exp(-x))",
+            "\t}",
+            "\treturn math.Exp(x) / (1.0 + math.Exp(x))",
+            "}",
+            "",
+            "// Predict returns 0 or 1 (threshold 0.5).",
+            "func Predict(f []float64) int {",
+            "\tif PredictScore(f) >= 0 {",
+            "\t\treturn 1",
+            "\t}",
+            "\treturn 0",
+            "}",
+            "",
+        ]
+
+    tree_funcs: list[str] = []
+    for ti, t in enumerate(trees):
+        splits = t["splits"]
+        offset = tree_leaf_offset[ti]
+        if mode == "multiclass":
+            tree_funcs.append(f"func leafBase{ti}(f []float64) int {{")
+            if not splits:
+                tree_funcs.append(f"\treturn {offset}")
+            else:
+                tree_funcs.append("\ti := 0")
+                for level, s in enumerate(splits):
+                    fidx = int(s["float_feature_index"])
+                    border = go_f64(float(s["border"]))
+                    cond = (
+                        f"!(f[{fidx}] <= {border})"
+                        if nan_true_by_feature.get(fidx)
+                        else f"f[{fidx}] > {border}"
+                    )
+                    tree_funcs += [
+                        f"\tif {cond} {{",
+                        f"\t\ti |= {1 << level}",
+                        "\t}",
+                    ]
+                ret_expr = (
+                    f"{offset} + i*numClasses" if offset > 0 else "i * numClasses"
+                )
+                tree_funcs.append(f"\treturn {ret_expr}")
+            tree_funcs += ["}", ""]
+        else:
+            tree_funcs.append(f"func tree{ti}(f []float64) float64 {{")
+            if not splits:
+                tree_funcs.append(f"\treturn {go_f64(float(t['leaf_values'][0]))}")
+            else:
+                tree_funcs.append("\ti := 0")
+                for level, s in enumerate(splits):
+                    fidx = int(s["float_feature_index"])
+                    border = go_f64(float(s["border"]))
+                    cond = (
+                        f"!(f[{fidx}] <= {border})"
+                        if nan_true_by_feature.get(fidx)
+                        else f"f[{fidx}] > {border}"
+                    )
+                    tree_funcs += [
+                        f"\tif {cond} {{",
+                        f"\t\ti |= {1 << level}",
+                        "\t}",
+                    ]
+                idx_expr = f"{offset}+i" if offset > 0 else "i"
+                tree_funcs.append(f"\treturn leafValues[{idx_expr}]")
+            tree_funcs += ["}", ""]
+
+    if tree_funcs and tree_funcs[-1] == "":
+        tree_funcs.pop()
+
+    full_body = body_lines + tree_funcs
+    needs_math = mode in ("binary", "multiclass") or any(
+        "math." in line for line in full_body
+    )
+
+    header: list[str] = [f"package {pkg}", ""]
+    if needs_math:
+        header += ['import "math"', ""]
+
+    _write_file(output, "\n".join(header + full_body) + "\n")
 
 
 def _write_go_node_array(
@@ -1662,10 +2541,12 @@ def _print_summary(
     n_nodes: int,
     output: str,
     extra: str = "",
+    emit_mode: str = "compiled",
 ) -> None:
     print(f"Library : {library}")
-    print(f"Mode    : {mode}")
+    print(f"Task    : {mode}")
     print(f"Lang    : {lang}")
+    print(f"Emit    : {emit_mode}")
     print(f"Trees   : {n_trees}" + (f"  {extra}" if extra else ""))
     if n_nodes:
         print(f"Nodes   : {n_nodes}")
@@ -1684,14 +2565,18 @@ LIBRARY_NAMES: dict[str, str] = {
 }
 
 
-def _get_exporter(library: str, lang: str) -> Callable[[str, str, str], None]:
+def _get_exporter(
+    library: str, lang: str, emit_mode: str = "compiled"
+) -> Callable[[str, str, str], None]:
     fns = {
         "xgboost": export_xgb,
         "lightgbm": export_lgbm,
         "catboost": export_cb,
     }
     fn = fns[library]
-    return lambda path, output, cls: fn(path, output, cls, lang=lang)
+    return lambda path, output, cls: fn(
+        path, output, cls, lang=lang, emit_mode=emit_mode
+    )
 
 
 def detect_library(model_path: str) -> str | None:
@@ -1731,6 +2616,14 @@ def run_interactive() -> None:
         print("Invalid language. Choose cs or go.")
         sys.exit(1)
 
+    emit_input = (
+        input("Representation [compiled/array] (default: compiled): ").strip().lower()
+        or "compiled"
+    )
+    if emit_input not in ("compiled", "array"):
+        print("Invalid representation. Choose compiled or array.")
+        sys.exit(1)
+
     if lang_input == "cs":
         name_prompt = "C# class name [Model]: "
         default_name = "Model"
@@ -1748,7 +2641,7 @@ def run_interactive() -> None:
     output = input(f"Output file [{default_output}]: ").strip() or default_output
 
     print()
-    _get_exporter(library, lang_input)(model_path, output, class_name)
+    _get_exporter(library, lang_input, emit_input)(model_path, output, class_name)
     print("\nDone.")
 
 
@@ -1766,12 +2659,13 @@ def run_cli(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     lang = args.lang
+    emit_mode = args.emit_mode
     default_name = "Model" if lang == "cs" else "model"
     class_name = args.class_name or default_name
     default_ext = ".cs" if lang == "cs" else ".go"
     output = args.output or f"{class_name}{default_ext}"
 
-    _get_exporter(library, lang)(model_path, output, class_name)
+    _get_exporter(library, lang, emit_mode)(model_path, output, class_name)
     print("\nDone.")
 
 
@@ -1797,6 +2691,13 @@ if __name__ == "__main__":
         choices=["cs", "go"],
         default="cs",
         help="Output language: cs (default) or go",
+    )
+    _ = parser.add_argument(
+        "--mode",
+        dest="emit_mode",
+        choices=["compiled", "array"],
+        default="compiled",
+        help="Codegen mode: compiled (default, fastest) or array (data-array evaluator)",
     )
 
     args = parser.parse_args()
